@@ -5,6 +5,11 @@ A proxy designed for testing
 
 This repository root contains a small Node.js transparent proxy.
 
+- Runtime: Node.js 24.16.0 LTS
+- Language: TypeScript 6.0.3
+- Module system: ECMAScript modules with `moduleResolution: NodeNext`
+- ECMAScript target/library: `ESNext`
+
 - TCP forward for traffic from Istio to a microservice
 - HTTP CONNECT proxy for traffic from a microservice to Istio
 - Raw request bytes are written to `*.request.bin`
@@ -14,7 +19,15 @@ This repository root contains a small Node.js transparent proxy.
 Run locally:
 
 ```sh
+npm install
+npm run build
 npm start
+```
+
+Validate locally:
+
+```sh
+npm run check
 ```
 
 ## Demo

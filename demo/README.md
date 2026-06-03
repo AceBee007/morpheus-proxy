@@ -37,6 +37,9 @@ cd demo
 docker compose up --build -d
 ```
 
+The `morpheus-proxy` image builds the root TypeScript proxy with Node.js
+24.16.0 LTS and then runs the compiled ESM output.
+
 ## Verify HTTP
 
 ```sh

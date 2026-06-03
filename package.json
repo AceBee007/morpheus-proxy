@@ -3,12 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "description": "Transparent proxy for local morpheus proxy experiments",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
-    "start": "node src/proxy.js",
-    "check": "node --check src/proxy.js"
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/proxy.js"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "typescript": "6.0.3"
   }
 }
