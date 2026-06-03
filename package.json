@@ -1,0 +1,14 @@
+{
+  "name": "morpheus-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Transparent proxy for local morpheus proxy experiments",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/proxy.js",
+    "check": "node --check src/proxy.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
