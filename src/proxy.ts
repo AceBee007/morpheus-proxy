@@ -1,8 +1,9 @@
 import * as fs from 'node:fs';
+import * as http2 from 'node:http2';
 import * as net from 'node:net';
 import * as path from 'node:path';
 
-type ProxyMode = 'tcp-forward' | 'http-connect';
+type ProxyMode = 'tcp-forward' | 'http-connect' | 'grpc-early-return';
 
 type ForwardConfig = {
   name: string;
@@ -15,6 +16,14 @@ type ConnectProxyConfig = {
   name: string;
   listenPort: number;
   listenHost: string;
+};
+
+type GrpcEarlyReturnConfig = {
+  name: string;
+  listenPort: number;
+  listenHost: string;
+  grpcPath: string;
+  responseValue: string;
 };
 
 type Address = {
@@ -38,6 +47,8 @@ type LoggerMeta = {
   target: string;
   client: string;
   connectRequest?: ConnectRequest;
+  grpcPath?: string;
+  earlyReturned?: boolean;
   error?: string;
   clientError?: string;
   upstreamError?: string;
@@ -84,6 +95,14 @@ function main(): void {
     name: 'outbound-connect',
     listenHost: process.env.CONNECT_LISTEN_HOST ?? '0.0.0.0',
     listenPort: numberEnv('CONNECT_LISTEN_PORT', 15000)
+  });
+
+  startGrpcEarlyReturnServer({
+    name: 'animal-sound-early-return',
+    listenHost: process.env.ANIMAL_SOUND_LISTEN_HOST ?? '0.0.0.0',
+    listenPort: numberEnv('ANIMAL_SOUND_LISTEN_PORT', 15052),
+    grpcPath: env('ANIMAL_SOUND_GRPC_PATH', '/demo.AnimalSoundService/Sound'),
+    responseValue: env('ANIMAL_SOUND_DUMMY_VALUE', 'Dummy')
   });
 }
 
@@ -181,6 +200,68 @@ function startConnectProxy(config: ConnectProxyConfig): void {
   });
 }
 
+function startGrpcEarlyReturnServer(config: GrpcEarlyReturnConfig): void {
+  const server = http2.createServer();
+
+  server.on('stream', (stream, headers) => {
+    const grpcPath = singleHeaderValue(headers[':path']) ?? '';
+    const logger = createConnectionLogger(config.name, {
+      mode: 'grpc-early-return',
+      target: config.grpcPath,
+      client: stream.session ? remoteAddress(stream.session.socket) : 'unknown:0',
+      grpcPath
+    });
+
+    stream.on('data', (chunk: Buffer) => {
+      logger.request.write(chunk);
+    });
+    stream.on('error', (err) => {
+      logger.meta.clientError = err.message;
+      logger.writeMeta();
+    });
+    stream.on('close', () => logger.close());
+
+    stream.on('end', () => {
+      if (grpcPath !== config.grpcPath) {
+        sendGrpcStatus(stream, logger, 12, `unimplemented path: ${grpcPath}`);
+        return;
+      }
+
+      const responseBody = grpcResponseFrame(encodeStringValue(config.responseValue));
+      logger.meta.earlyReturned = true;
+      logger.response.write(responseBody);
+      logger.writeMeta();
+
+      stream.respond(
+        {
+          ':status': 200,
+          'content-type': 'application/grpc',
+          'grpc-encoding': 'identity'
+        },
+        { waitForTrailers: true }
+      );
+      stream.on('wantTrailers', () => {
+        stream.sendTrailers({
+          'grpc-status': '0',
+          'grpc-message': ''
+        });
+      });
+      stream.end(responseBody);
+    });
+  });
+
+  server.on('error', (err) => {
+    console.error(`[${config.name}] listen error:`, err);
+    process.exitCode = 1;
+  });
+
+  server.listen(config.listenPort, config.listenHost, () => {
+    console.log(
+      `[${config.name}] returning ${config.responseValue} for ${config.grpcPath} on ${config.listenHost}:${config.listenPort}`
+    );
+  });
+}
+
 function bridge(client: net.Socket, upstream: net.Socket, logger: ConnectionLogger): void {
   client.on('data', (chunk: Buffer) => {
     logger.request.write(chunk);
@@ -218,6 +299,40 @@ function bridge(client: net.Socket, upstream: net.Socket, logger: ConnectionLogg
   });
   client.on('close', close);
   upstream.on('close', close);
+}
+
+function sendGrpcStatus(
+  stream: http2.ServerHttp2Stream,
+  logger: ConnectionLogger,
+  status: number,
+  message: string
+): void {
+  logger.meta.error = message;
+  logger.writeMeta();
+  stream.respond({
+    ':status': 200,
+    'content-type': 'application/grpc',
+    'grpc-status': String(status),
+    'grpc-message': encodeURIComponent(message)
+  });
+  stream.end();
+}
+
+function grpcResponseFrame(payload: Buffer): Buffer {
+  const frame = Buffer.alloc(5 + payload.length);
+  frame.writeUInt8(0, 0);
+  frame.writeUInt32BE(payload.length, 1);
+  payload.copy(frame, 5);
+  return frame;
+}
+
+function encodeStringValue(value: string): Buffer {
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length > 127) {
+    throw new Error('StringValue payload is too long for the minimal encoder');
+  }
+
+  return Buffer.concat([Buffer.from([0x0a, bytes.length]), bytes]);
 }
 
 function createConnectionLogger(
@@ -312,6 +427,13 @@ function parsePort(value: string, address: string): number {
 
 function remoteAddress(socket: net.Socket): string {
   return `${socket.remoteAddress ?? 'unknown'}:${socket.remotePort ?? 0}`;
+}
+
+function singleHeaderValue(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  return value;
 }
 
 function env(key: string, fallback: string): string {

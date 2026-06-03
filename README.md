@@ -12,6 +12,7 @@ This repository root contains a small Node.js transparent proxy.
 
 - TCP forward for traffic from Istio to a microservice
 - HTTP CONNECT proxy for traffic from a microservice to Istio
+- gRPC early return for `/demo.AnimalSoundService/Sound`
 - Raw request bytes are written to `*.request.bin`
 - Raw response bytes are written to `*.response.bin`
 - Connection metadata is written to `*.meta.json`

@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	EchoMethod = "/demo.EchoService/Echo"
-	NowMethod  = "/demo.TimeService/Now"
+	EchoMethod        = "/demo.EchoService/Echo"
+	NowMethod         = "/demo.TimeService/Now"
+	AnimalSoundMethod = "/demo.AnimalSoundService/Sound"
 )
 
 type EchoServer interface {
@@ -22,6 +23,10 @@ type EchoServer interface {
 
 type TimeServer interface {
 	Now(context.Context, *emptypb.Empty) (*wrapperspb.StringValue, error)
+}
+
+type AnimalSoundServer interface {
+	Sound(context.Context, *emptypb.Empty) (*wrapperspb.StringValue, error)
 }
 
 type UnimplementedEchoServer struct{}
@@ -36,12 +41,22 @@ func (UnimplementedTimeServer) Now(context.Context, *emptypb.Empty) (*wrapperspb
 	return nil, status.Error(codes.Unimplemented, "method Now not implemented")
 }
 
+type UnimplementedAnimalSoundServer struct{}
+
+func (UnimplementedAnimalSoundServer) Sound(context.Context, *emptypb.Empty) (*wrapperspb.StringValue, error) {
+	return nil, status.Error(codes.Unimplemented, "method Sound not implemented")
+}
+
 func RegisterEchoServer(registrar grpc.ServiceRegistrar, server EchoServer) {
 	registrar.RegisterService(&EchoServiceDesc, server)
 }
 
 func RegisterTimeServer(registrar grpc.ServiceRegistrar, server TimeServer) {
 	registrar.RegisterService(&TimeServiceDesc, server)
+}
+
+func RegisterAnimalSoundServer(registrar grpc.ServiceRegistrar, server AnimalSoundServer) {
+	registrar.RegisterService(&AnimalSoundServiceDesc, server)
 }
 
 func InvokeEcho(ctx context.Context, conn grpc.ClientConnInterface, message string, opts ...grpc.CallOption) (*structpb.Struct, error) {
@@ -55,6 +70,14 @@ func InvokeEcho(ctx context.Context, conn grpc.ClientConnInterface, message stri
 func InvokeNow(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) (string, error) {
 	out := new(wrapperspb.StringValue)
 	if err := conn.Invoke(ctx, NowMethod, &emptypb.Empty{}, out, opts...); err != nil {
+		return "", err
+	}
+	return out.Value, nil
+}
+
+func InvokeAnimalSound(ctx context.Context, conn grpc.ClientConnInterface, opts ...grpc.CallOption) (string, error) {
+	out := new(wrapperspb.StringValue)
+	if err := conn.Invoke(ctx, AnimalSoundMethod, &emptypb.Empty{}, out, opts...); err != nil {
 		return "", err
 	}
 	return out.Value, nil
@@ -80,6 +103,19 @@ var TimeServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Now",
 			Handler:    nowHandler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/demo.proto",
+}
+
+var AnimalSoundServiceDesc = grpc.ServiceDesc{
+	ServiceName: "demo.AnimalSoundService",
+	HandlerType: (*AnimalSoundServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Sound",
+			Handler:    animalSoundHandler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -120,6 +156,25 @@ func nowHandler(server interface{}, ctx context.Context, dec func(interface{}) e
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return server.(TimeServer).Now(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func animalSoundHandler(server interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return server.(AnimalSoundServer).Sound(ctx, in)
+	}
+
+	info := &grpc.UnaryServerInfo{
+		Server:     server,
+		FullMethod: AnimalSoundMethod,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return server.(AnimalSoundServer).Sound(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }

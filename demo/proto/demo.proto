@@ -15,3 +15,7 @@ service EchoService {
 service TimeService {
   rpc Now(google.protobuf.Empty) returns (google.protobuf.StringValue);
 }
+
+service AnimalSoundService {
+  rpc Sound(google.protobuf.Empty) returns (google.protobuf.StringValue);
+}

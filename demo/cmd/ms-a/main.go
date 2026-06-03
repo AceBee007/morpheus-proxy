@@ -25,7 +25,8 @@ import (
 
 type echoServer struct {
 	rpc.UnimplementedEchoServer
-	timeConn *grpc.ClientConn
+	timeConn        *grpc.ClientConn
+	animalSoundConn *grpc.ClientConn
 }
 
 type bufferedConn struct {
@@ -36,6 +37,7 @@ type bufferedConn struct {
 type echoResponse struct {
 	Message      string `json:"message"`
 	UpstreamTime string `json:"upstream_time"`
+	AnimalSound  string `json:"animal_sound"`
 	ServedBy     string `json:"served_by"`
 	Protocol     string `json:"protocol"`
 }
@@ -48,6 +50,7 @@ func (s echoServer) Echo(ctx context.Context, req *wrapperspb.StringValue) (*str
 	return structpb.NewStruct(map[string]interface{}{
 		"message":       response.Message,
 		"upstream_time": response.UpstreamTime,
+		"animal_sound":  response.AnimalSound,
 		"served_by":     response.ServedBy,
 		"protocol":      response.Protocol,
 	})
@@ -89,9 +92,14 @@ func (s echoServer) echo(ctx context.Context, message, protocol string) (echoRes
 	if err != nil {
 		return echoResponse{}, err
 	}
+	animalSound, err := rpc.InvokeAnimalSound(ctx, s.animalSoundConn)
+	if err != nil {
+		return echoResponse{}, err
+	}
 	return echoResponse{
-		Message:      message,
+		Message:      fmt.Sprintf("%s %s %s", upstreamTime, message, animalSound),
 		UpstreamTime: upstreamTime,
+		AnimalSound:  animalSound,
 		ServedBy:     "ms-a",
 		Protocol:     protocol,
 	}, nil
@@ -101,6 +109,7 @@ func main() {
 	httpAddr := env("HTTP_ADDR", ":8080")
 	grpcAddr := env("GRPC_ADDR", ":50051")
 	timeAddr := env("MS_B_ADDR", "127.0.0.1:50052")
+	animalSoundAddr := env("MS_B_ANIMAL_SOUND_ADDR", timeAddr)
 	grpcProxyAddr := os.Getenv("GRPC_PROXY_ADDR")
 
 	dialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
@@ -114,7 +123,13 @@ func main() {
 	}
 	defer timeConn.Close()
 
-	server := echoServer{timeConn: timeConn}
+	animalSoundConn, err := grpc.NewClient(animalSoundAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("create animal sound grpc client for %s: %v", animalSoundAddr, err)
+	}
+	defer animalSoundConn.Close()
+
+	server := echoServer{timeConn: timeConn, animalSoundConn: animalSoundConn}
 	errs := make(chan error, 2)
 
 	go func() {
@@ -125,7 +140,7 @@ func main() {
 		}
 		grpcServer := grpc.NewServer()
 		rpc.RegisterEchoServer(grpcServer, server)
-		log.Printf("ms-a echo grpc listening on %s, time upstream %s, proxy %s", grpcAddr, timeAddr, grpcProxyAddr)
+		log.Printf("ms-a echo grpc listening on %s, time upstream %s, animal sound upstream %s, proxy %s", grpcAddr, timeAddr, animalSoundAddr, grpcProxyAddr)
 		errs <- grpcServer.Serve(listener)
 	}()
 
@@ -135,7 +150,7 @@ func main() {
 			Handler:           httpHandler(server),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
-		log.Printf("ms-a echo http listening on %s, time upstream %s, proxy %s", httpAddr, timeAddr, grpcProxyAddr)
+		log.Printf("ms-a echo http listening on %s, time upstream %s, animal sound upstream %s, proxy %s", httpAddr, timeAddr, animalSoundAddr, grpcProxyAddr)
 		errs <- httpServer.ListenAndServe()
 	}()
 

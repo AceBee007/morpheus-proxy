@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"time"
@@ -15,10 +17,20 @@ import (
 
 type timeServer struct {
 	rpc.UnimplementedTimeServer
+	rpc.UnimplementedAnimalSoundServer
 }
 
 func (timeServer) Now(context.Context, *emptypb.Empty) (*wrapperspb.StringValue, error) {
 	return wrapperspb.String(time.Now().UTC().Format(time.RFC3339Nano)), nil
+}
+
+func (timeServer) Sound(context.Context, *emptypb.Empty) (*wrapperspb.StringValue, error) {
+	sounds := []string{"woof", "meow", "moo", "baa", "neigh"}
+	index, err := rand.Int(rand.Reader, bigInt(len(sounds)))
+	if err != nil {
+		return nil, err
+	}
+	return wrapperspb.String(sounds[index.Int64()]), nil
 }
 
 func main() {
@@ -30,12 +42,18 @@ func main() {
 	}
 
 	server := grpc.NewServer()
-	rpc.RegisterTimeServer(server, timeServer{})
+	service := timeServer{}
+	rpc.RegisterTimeServer(server, service)
+	rpc.RegisterAnimalSoundServer(server, service)
 
 	log.Printf("ms-b time grpc listening on %s", addr)
 	if err := server.Serve(listener); err != nil {
 		log.Fatalf("serve grpc: %v", err)
 	}
+}
+
+func bigInt(value int) *big.Int {
+	return big.NewInt(int64(value))
 }
 
 func env(key, fallback string) string {
