@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package demo;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "morpheus-proxy/demo/internal/rpc";
+
+service EchoService {
+  rpc Echo(google.protobuf.StringValue) returns (google.protobuf.Struct);
+}
+
+service TimeService {
+  rpc Now(google.protobuf.Empty) returns (google.protobuf.StringValue);
+}
