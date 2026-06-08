@@ -21,6 +21,7 @@ proxy connects to the local outbound Istio listener at `ms-a-istio:15001`.
   - TCP forward: `ms-a-istio -> morpheus-proxy -> ms-a`
   - HTTP CONNECT: `ms-a -> morpheus-proxy -> ms-a-istio`
   - gRPC early return: `/demo.AnimalSoundService/Sound` returns `Dummy`
+  - status UI: `http://localhost:18081`
   - logs raw request and response bytes under `demo/logs/morpheus-proxy`
 - `ms-b`: time service
   - gRPC: `demo.TimeService/Now`
@@ -51,6 +52,17 @@ docker compose up --build -d
 
 The `morpheus-proxy` image builds the root TypeScript proxy with Node.js
 24.16.0 LTS and then runs the compiled ESM output.
+
+## Status UI
+
+Open:
+
+```sh
+open http://localhost:18081
+```
+
+The page streams proxy access logs in real time and keeps only the latest 100
+entries in the browser and server memory.
 
 ## Verify HTTP
 

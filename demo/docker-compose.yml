@@ -32,12 +32,16 @@ services:
       CONNECT_LISTEN_PORT: 15000
       ANIMAL_SOUND_LISTEN_PORT: 15052
       ANIMAL_SOUND_DUMMY_VALUE: Dummy
+      STATUS_LISTEN_PORT: 18081
     volumes:
       - ./logs/morpheus-proxy:/var/log/morpheus-proxy
+    ports:
+      - "${MORPHEUS_PROXY_STATUS_PORT:-18081}:18081"
     expose:
       - "15000"
       - "15051"
       - "15052"
+      - "18081"
       - "18080"
 
   ms-a-istio:
