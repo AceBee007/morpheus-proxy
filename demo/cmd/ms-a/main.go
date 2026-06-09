@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"morpheus-proxy/demo/internal/rpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -40,6 +43,10 @@ type echoResponse struct {
 	AnimalSound  string `json:"animal_sound"`
 	ServedBy     string `json:"served_by"`
 	Protocol     string `json:"protocol"`
+}
+
+type metadataIDTokenCredentials struct {
+	audience string
 }
 
 func (s echoServer) Echo(ctx context.Context, req *wrapperspb.StringValue) (*structpb.Struct, error) {
@@ -111,19 +118,26 @@ func main() {
 	timeAddr := env("MS_B_ADDR", "127.0.0.1:50052")
 	animalSoundAddr := env("MS_B_ANIMAL_SOUND_ADDR", timeAddr)
 	grpcProxyAddr := os.Getenv("GRPC_PROXY_ADDR")
-
-	dialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	if grpcProxyAddr != "" {
-		dialOptions = append(dialOptions, grpc.WithContextDialer(connectProxyDialer(grpcProxyAddr)))
+	timeDialOptions, err := grpcDialOptions(timeAddr, grpcProxyAddr)
+	if err != nil {
+		log.Fatalf("configure time grpc client for %s: %v", timeAddr, err)
 	}
 
-	timeConn, err := grpc.NewClient(timeAddr, dialOptions...)
+	animalSoundDialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if animalSoundAddr == timeAddr {
+		animalSoundDialOptions, err = grpcDialOptions(animalSoundAddr, "")
+		if err != nil {
+			log.Fatalf("configure animal sound grpc client for %s: %v", animalSoundAddr, err)
+		}
+	}
+
+	timeConn, err := grpc.NewClient(timeAddr, timeDialOptions...)
 	if err != nil {
 		log.Fatalf("create time grpc client for %s: %v", timeAddr, err)
 	}
 	defer timeConn.Close()
 
-	animalSoundConn, err := grpc.NewClient(animalSoundAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	animalSoundConn, err := grpc.NewClient(animalSoundAddr, animalSoundDialOptions...)
 	if err != nil {
 		log.Fatalf("create animal sound grpc client for %s: %v", animalSoundAddr, err)
 	}
@@ -204,6 +218,83 @@ func connectProxyDialer(proxyAddr string) func(context.Context, string) (net.Con
 	}
 }
 
+func grpcDialOptions(targetAddr, grpcProxyAddr string) ([]grpc.DialOption, error) {
+	if !envBool("MS_B_TLS") {
+		dialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+		if grpcProxyAddr != "" {
+			dialOptions = append(dialOptions, grpc.WithContextDialer(connectProxyDialer(grpcProxyAddr)))
+		}
+		return dialOptions, nil
+	}
+
+	host, err := hostFromTarget(targetAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	dialOptions := []grpc.DialOption{
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: host,
+		})),
+	}
+	if audience := os.Getenv("MS_B_AUTH_AUDIENCE"); audience != "" {
+		dialOptions = append(dialOptions, grpc.WithPerRPCCredentials(metadataIDTokenCredentials{audience: audience}))
+	}
+	return dialOptions, nil
+}
+
+func hostFromTarget(targetAddr string) (string, error) {
+	if parsed, err := url.Parse(targetAddr); err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname(), nil
+	}
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err == nil {
+		return host, nil
+	}
+	if strings.Count(targetAddr, ":") == 0 {
+		return targetAddr, nil
+	}
+	return "", fmt.Errorf("target %q must include a host name", targetAddr)
+}
+
+func (c metadataIDTokenCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
+	token, err := metadataIDToken(ctx, c.audience)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]string{"authorization": "Bearer " + token}, nil
+}
+
+func (metadataIDTokenCredentials) RequireTransportSecurity() bool {
+	return true
+}
+
+func metadataIDToken(ctx context.Context, audience string) (string, error) {
+	requestURL := "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=" +
+		url.QueryEscape(audience)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Metadata-Flavor", "Google")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8192))
+	if err != nil {
+		return "", err
+	}
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata identity token request failed: %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 func httpHandler(server echoServer) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/echo", server.httpEcho)
@@ -235,4 +326,13 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(key string) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
