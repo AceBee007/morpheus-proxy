@@ -16,6 +16,7 @@ spec:
       labels:
         app.kubernetes.io/name: ms-b
         app.kubernetes.io/part-of: morpheus-proxy-demo
+        sidecar.istio.io/inject: "false"
     spec:
       containers:
         - name: ms-b

@@ -4,3 +4,4 @@ metadata:
   name: morpheus-proxy-demo
   labels:
     app.kubernetes.io/part-of: morpheus-proxy-demo
+    istio.io/rev: default

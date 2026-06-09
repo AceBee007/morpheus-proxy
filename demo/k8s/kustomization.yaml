@@ -4,3 +4,4 @@ resources:
   - namespace.yaml
   - ms-b.yaml
   - ms-a.yaml
+  - ms-a-istio.yaml
