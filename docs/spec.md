@@ -71,8 +71,9 @@ L7 rule は `http` / `http2` / `grpc` listener に限定する。`connect` / `tc
 ### 4.1 デフォルト転送
 
 - ルール未設定時は、受け取った request を upstream にそのまま転送し、upstream response をそのまま client に返す
-- request / response の traffic metadata はログ保存対象である
-- body payload は matcher に一致した、または intercept / manipulation された traffic だけ保存する
+- capture / intercepted traffic の request / response metadata はログ保存対象である
+- body payload は capture 用 matcher に一致した、または intercept / manipulation された traffic だけ保存する
+- unmatched passthrough traffic は traffic log に保存しない
 - proxy が protocol を解釈できない場合は connection metadata を保存し、payload body は保存しない
 - 透過転送時も trace id / request id を生成または継承し、ログと response metadata に関連付ける
 
@@ -126,11 +127,41 @@ POST   /_morpheus/api/v1/rules:import
 
 `rules:simulate`:
 
-- 既存 log に対して現在の rule set、または編集中の rule draft を適用した場合の結果を返す
+- 既存 traffic log に対して現在の rule set、または編集中の rule draft を適用した場合の結果を返す
+- request body / response body を使った simulation には、事前に capture 用 matcher を設定して対象 traffic を logging しておく必要がある
 - counter は消費しない
 - upstream には送信しない
 - response body は実際には変更せず、どの matcher が一致し、どの action が選択され、どの field が変更されるかを返す
 - script matcher / manipulator は sandbox 内で実行し、error / timeout は simulation result と application log に記録する
+
+Simulation request 例:
+
+```json
+{
+  "logIds": ["2026-06-10T00-00-00.000Z-000001"],
+  "ruleDraft": {
+    "id": "draft-rule",
+    "enabled": true,
+    "priority": 100,
+    "protocol": "http",
+    "phase": "response",
+    "match": {
+      "type": "regex",
+      "field": "path",
+      "pattern": "^/users"
+    },
+    "action": {
+      "type": "response_replace",
+      "target": "body",
+      "from": "real",
+      "to": "mock"
+    }
+  },
+  "options": {
+    "includeBodyDiff": true
+  }
+}
+```
 
 #### 4.2.3 Rule state
 
@@ -214,10 +245,15 @@ Rule は以下の JSON model で表現する。
     "limit": 3,
     "afterExhausted": "passthrough"
   },
+  "logging": {
+    "capture": false
+  },
   "createdAt": "2026-06-10T00:00:00.000Z",
   "updatedAt": "2026-06-10T00:00:00.000Z"
 }
 ```
+
+`logging.capture` は通信を変更せずに対象 traffic の body を保存したい場合に使う。通常は `action.type: "passthrough"` と組み合わせ、rule 追加前の simulation 用 log を収集する。
 
 #### 4.3.1 Rule ordering
 
@@ -784,9 +820,40 @@ Logging は traffic log と application log を分ける。
 Traffic log:
 
 - proxy を通過した request / response の metadata を記録する
-- matcher に一致した、または intercept / manipulation された request / response の body を記録する
+- capture 用 matcher に一致した、または intercept / manipulation された request / response の body を記録する
 - fault injection で生成した response を記録する
-- passthrough だけの unmatched traffic は body を保存しない
+- passthrough だけの unmatched traffic は traffic log に保存しない
+
+Traffic capture workflow:
+
+1. まず capture 用 matcher rule を登録する
+2. capture rule に match した request / response は通信を変更せず passthrough し、body log policy に従って body を保存する
+3. 保存された traffic log に対して `rules:simulate` を実行し、追加予定の rule がどう match / manipulate するか確認する
+4. simulation 結果を確認してから、本番の fault / mock / manipulation rule を登録する
+
+Capture rule は `action.type: "passthrough"` と `logging.capture: true` を持つ通常 rule として表現する。
+Capture rule は non-terminal として扱い、後続 rule の評価を止めない。
+
+```json
+{
+  "id": "capture-users",
+  "enabled": true,
+  "priority": 10,
+  "protocol": "http",
+  "phase": "both",
+  "match": {
+    "type": "regex",
+    "field": "path",
+    "pattern": "^/users"
+  },
+  "action": {
+    "type": "passthrough"
+  },
+  "logging": {
+    "capture": true
+  }
+}
+```
 
 Application log:
 
@@ -803,7 +870,7 @@ Traffic log と application log は別々の sink / file / directory に保存�
 
 #### 4.9.1 Log event model
 
-すべての request は traffic metadata entry を持つ。body payload は body log policy に従って保存する。
+Traffic log entry は capture / intercepted / fault / mock / manipulated traffic に対して作成する。unmatched passthrough traffic は traffic log に保存しない。
 
 ```json
 {
@@ -852,10 +919,11 @@ Traffic log と application log は別々の sink / file / directory に保存�
 
 #### 4.9.2 保存対象
 
-- traffic metadata for every request
+- traffic metadata for capture / intercepted / fault / mock / manipulated traffic
 - matched rule 一覧
 - applied action 一覧
-- matcher に一致した original request
+- `logging.capture: true` の rule に一致した original request / returned response
+- intercept / manipulation された original request
 - request rewrite 後の forwarded request
 - response phase rule に一致した upstream response
 - client に返した returned response
@@ -869,12 +937,14 @@ Traffic log と application log は別々の sink / file / directory に保存�
 
 #### 4.9.3 Body log policy
 
-- unmatched passthrough traffic の body は保存しない
-- matcher に一致した、または intercept / manipulation された HTTP request / response は raw body を file に保存する
+- unmatched passthrough traffic は traffic log に保存しない
+- `logging.capture: true` の rule に一致した HTTP request / response は raw body を file に保存する
+- intercept / manipulation された HTTP request / response は raw body を file に保存する
+- matcher に一致しても `logging.capture: true` がなく、action が passthrough の場合、body は保存しない
 - request rewrite が行われた場合は original request body と forwarded request body を保存する
 - response manipulation が行われた場合は upstream response body と returned response body を保存する
 - fault injection / mock response は生成した response body を保存する
-- gRPC は descriptor がある場合のみ decode 後の JSON/text representation を保存する
+- gRPC は descriptor がある場合のみ、`logging.capture: true` の rule に一致した、または intercept / manipulation された message の decode 後 JSON/text representation を保存する
 - gRPC は descriptor がない場合、metadata / path / grpc-status / grpc-message のみ保存し、body は保存しない
 - 管理 API の一覧では preview のみ返す
 - 既定 preview size は 4KB
@@ -908,25 +978,22 @@ Retention 超過時は古い log から削除する。削除は metadata、reque
 - `password`
 - `token`
 
-Redaction は header と JSON body path に適用できる。HTTP raw body file は完全な redaction が難しいため、保存対象を matched/intercepted traffic に限定する。
+Redaction は header と JSON body path に適用できる。HTTP raw body file は完全な redaction が難しいため、保存対象を capture/intercepted traffic に限定する。
 
-Mask 設定は起動 config の YAML / JSON で定義する。
+Mask 設定は起動 config の JSONC で定義する。
 
-```yaml
-logging:
-  mask:
-    headers:
-      - authorization
-      - cookie
-      - set-cookie
-      - x-api-key
-    jsonPaths:
-      - $.password
-      - $.token
-      - $.credentials.*
+```jsonc
+{
+  "logging": {
+    "mask": {
+      "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+      "jsonPaths": ["$.password", "$.token", "$.credentials.*"]
+    }
+  }
+}
 ```
 
-Mask は traffic log の metadata、header、HTTP JSON body preview、gRPC decoded body に適用する。HTTP raw body file は完全な redaction が難しいため、matched/intercepted body のみ保存する方針で leak surface を小さくする。
+Mask は traffic log の metadata、header、HTTP JSON body preview、gRPC decoded body に適用する。HTTP raw body file は完全な redaction が難しいため、capture/intercepted body のみ保存する方針で leak surface を小さくする。
 
 ### 4.10 Hot load と永続化
 
@@ -995,56 +1062,67 @@ Prometheus format は提案機能として `/_morpheus/metrics` でも提供で�
 
 ### 4.13 Configuration
 
-設定は env var と YAML / JSON config file の両方をサポートする。
+アプリ設定の主ソースは JSONC config file とする。JSONC を採用する理由は、テスト用設定でコメントを残しながら JSON schema validation できるようにするためである。
 
-```yaml
-admin:
-  host: 127.0.0.1
-  port: 18081
-  basePath: /_morpheus
-  authToken: null
+Config 読み込み要件:
 
-listeners:
-  - name: http
-    protocol: http
-    host: 0.0.0.0
-    port: 18080
-    upstream: http://127.0.0.1:8080
-    maxRequestBodyBufferBytes: 1048576
-    maxResponseBodyBufferBytes: 1048576
-  - name: grpc
-    protocol: grpc
-    host: 0.0.0.0
-    port: 15051
-    upstream: h2c://127.0.0.1:50051
-    descriptors: []
-    maxRequestBodyBufferBytes: 1048576
-    maxResponseBodyBufferBytes: 1048576
+- config file path は CLI option または `MORPHEUS_CONFIG` で指定する
+- config file が存在しない、読めない、JSONC parse に失敗する、schema validation に失敗する、参照 descriptor file が読めない場合、app は起動に失敗する
+- 起動失敗時は application log と stderr に理由を出し、non-zero exit code で終了する
+- config 読み込み前に `appLogDir` が確定していない場合、stderr を authoritative な失敗出力とし、application log への書き込みは best effort とする
+- env var は config path、admin token などの secret / deployment-specific override に限定する
+- env override 後の最終 config も schema validation し、失敗した場合は起動しない
 
-rules:
-  store: memory
-
-script:
-  sandbox: subprocess
-  timeoutMs: 300000
-
-logging:
-  trafficLogDir: logs/morpheus-proxy/traffic
-  appLogDir: logs/morpheus-proxy/app
-  trafficMaxEntries: 1000
-  trafficMaxBytes: 104857600
-  trafficRetentionMs: 86400000
-  appRetentionMs: 86400000
-  mask:
-    headers:
-      - authorization
-      - cookie
-      - set-cookie
-      - x-api-key
-    jsonPaths:
-      - $.password
-      - $.token
-      - $.credentials.*
+```jsonc
+{
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    "basePath": "/_morpheus",
+    "authToken": null
+  },
+  "listeners": [
+    {
+      "name": "http",
+      "protocol": "http",
+      "host": "0.0.0.0",
+      "port": 18080,
+      "upstream": "http://127.0.0.1:8080",
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    },
+    {
+      "name": "grpc",
+      "protocol": "grpc",
+      "host": "0.0.0.0",
+      "port": 15051,
+      "upstream": "h2c://127.0.0.1:50051",
+      // Descriptor files are required for gRPC body decode/edit.
+      "descriptors": [],
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    }
+  ],
+  "rules": {
+    "store": "memory"
+  },
+  "script": {
+    "sandbox": "subprocess",
+    "timeoutMs": 300000
+  },
+  "logging": {
+    "trafficLogDir": "logs/morpheus-proxy/traffic",
+    "appLogDir": "logs/morpheus-proxy/app",
+    "trafficMaxEntries": 1000,
+    "trafficMaxBytes": 104857600,
+    "trafficRetentionMs": 86400000,
+    "appRetentionMs": 86400000,
+    "mask": {
+      "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+      "jsonPaths": ["$.password", "$.token", "$.credentials.*"]
+    }
+  }
+}
 ```
 
 ## 5. UI Specification
@@ -1116,7 +1194,7 @@ Regex matcher と built-in action をフォームで設定する。
 
 #### 5.4.2 Advanced mode
 
-複合 matcher、pipeline action、per-key consume を JSON editor で編集する。
+複合 matcher、pipeline action、rule-id based consume を JSON editor で編集する。
 
 機能:
 
@@ -1296,7 +1374,7 @@ CI integration は初期仕様では扱わない。将来必要になった場�
 - script rule は初期仕様から許可するが、必ず sandbox subprocess で実行する
 - remote admin access では auth required
 - CORS disabled
-- body logging は matched/intercepted traffic に限定し、mask 設定を YAML / JSON config で定義する
+- body logging は capture/intercepted traffic に限定し、mask 設定を JSONC config で定義する
 
 ## 7. 実装優先度案
 
@@ -1307,7 +1385,7 @@ CI integration は初期仕様では扱わない。将来必要になった場�
 - HTTP request phase regex matcher
 - HTTP mock response / fault response
 - 消費型 fault injection
-- request / response log 保存
+- traffic metadata log と capture/intercepted body log 保存
 - log API
 
 ### 7.2 Milestone 2: HTTP response manipulation
@@ -1349,19 +1427,21 @@ CI integration は初期仕様では扱わない。将来必要になった場�
 - ルール未設定時、gRPC request は upstream に透過転送される
 - 管理 API から rule を登録すると、再起動なしで次 request から反映される
 - 管理 API から rule を削除すると、次 request から反映されなくなる
+- JSONC config の読み込み、parse、schema validation、descriptor 参照に失敗した場合、app は起動しない
 - HTTP path regex rule で mock response を返せる
 - HTTP response body の文字列置換 rule を設定できる
 - gRPC method matcher で grpc-status fault を返せる
 - 消費型 fault injection で最初の N 回だけ fault を返し、その後 passthrough できる
-- traffic metadata はすべての request で保存される
-- unmatched passthrough traffic の body は保存されない
-- matched / intercepted traffic の request と returned response は body log policy に従って保存される
+- unmatched passthrough traffic は traffic log に保存されない
+- capture / intercepted traffic の request と returned response は body log policy に従って保存される
 - fault injection で生成した response も log に保存される
 - response manipulation された場合、upstream response と returned response が保存される
 - gRPC body log / body manipulation は descriptor または `.proto` がある場合だけ許可される
 - script error / timeout 時は req/resp を編集せず passthrough し、traffic log と application log に記録される
 - 管理 API で rule 一覧、rule state、log 一覧、log 詳細を確認できる
+- capture 用 matcher rule で対象 traffic を passthrough しながら body logging できる
 - 管理 API で既存 log に rule を適用した場合の simulation を確認できる
+- body を使った simulation は capture 済み log を入力にして実行できる
 - UI で rule 一覧、log 一覧、manual matcher / manipulator 登録ができる
 - UI で revision conflict を検知し、古い rule set をベースにした保存を拒否できる
 
