@@ -2,89 +2,203 @@
 
 ## 1. 目的
 
-`morpheus-proxy` は、テスト環境で HTTP / gRPC トラフィックを透過的に転送しながら、リクエストとレスポンスを inspect、intercept、変更、mock、fault injection できるプロキシである。
+`morpheus-proxy` は、テスト環境(dev 環境)で HTTP / gRPC トラフィックを透過的に転送しながら、リクエストとレスポンスを inspect、intercept、変更、mock、fault injection できるプロキシである。
 
 主な用途は以下とする。
 
 - サービス間通信の実リクエストと実レスポンスを観測する
 - 特定条件のリクエストに対して upstream に転送せず mock response を返す
 - upstream response を受け取った後に response の一部を変更して返す
-- 一定回数だけ失敗させ、その後は正常系へ戻すような消費型 fault injection を行う
+- 一定回数だけ失敗・改変し、その後は正常系へ戻す消費型 rule を適用する
 - テスト中に管理 API / Web UI からルールを hot load し、プロセス再起動なしで挙動を変える
 
 ## 2. スコープ
 
 ### 2.1 Core 機能
 
-Core はプロキシとしての通信処理、ルール評価、fault injection、response manipulation、ログ保存、管理 API を担当する。
+Core はプロキシとしての通信処理、ルール評価、fault injection、request / response manipulation、ログ保存、管理 API を担当する。
 
 ### 2.2 UI 機能
 
 UI は管理用 Web front として、既存ルールの確認、ルール登録・更新・削除、ログ確認、手動 matcher / manipulator の登録、リアルタイム監視を担当する。
 
+UI と API の関係は以下の原則に従う。
+
+- UI は管理 API のみを通じて操作を行う。UI 専用の隠し API は作らない
+- UI でできる操作は必ず管理 API でもできる(API の機能集合は UI の機能集合を包含する)
+
 ### 2.3 明示的な非目標
 
-- 本番 traffic shaping 基盤としての高可用性運用は初期スコープ外とする
-- sandbox なしで script rule を実行することはスコープ外とする
-- HTTPS / TLS traffic の完全な payload inspect は、TLS 終端または MITM 設定なしではサポートしない
-- gRPC の全メッセージ型を descriptor なしで意味的に decode することはできない
+- TLS 終端 / TLS origination。本 proxy はマイクロサービスと istio sidecar の間に配置される前提であり、TLS / mTLS は istio が担当する。proxy は plaintext(HTTP/1.1、h2c)のみを扱う
+- 管理 API / UI の認証・認可。dev 環境での利用を前提とする。将来 remote 公開が必要になった時点で再検討する
+- rule の永続化。rule / mask 設定は on-memory で保持し、プロセス再起動で失われる。import / export を代替手段として提供する
+- gRPC streaming message body の manipulation(metadata / trailer / status の inspect / edit はサポートする)
+- 記録済み request の再送(replay)
+- TCP passthrough / HTTP CONNECT proxy。対象 protocol は HTTP と gRPC のみとする
+- scenario mode(複数 rule のセット切り替え)
+- CI integration
+- sandbox なしで script rule を実行すること
+- 本番 traffic shaping 基盤としての高可用性運用
+- 透過転送時のレイテンシオーバーヘッドの数値目標(dev 用途のため設けない)
 
 ## 3. 全体構成
 
-### 3.1 Data plane
+### 3.1 技術スタック
+
+- 実装言語: Node.js(LTS)+ TypeScript
+- script sandbox: 実装言語と同じ Node.js runtime を使い、proxy 本体とは別の subprocess で実行する
+- UI: React で実装し、build した静的 assets を SPA として admin server から配信する
+- 管理 API: JSON over HTTP/1.1
+
+### 3.2 デプロイモデル
+
+本 proxy はマイクロサービス(ms)と istio sidecar(istio-proxy)の間に挟んで使う。
+
+```text
+inbound:  peer service → istio-proxy (mTLS 終端) → morpheus-proxy → ms
+outbound: ms → morpheus-proxy → istio-proxy (mTLS) → peer service
+```
+
+- TLS / mTLS の終端と暗号化は istio-proxy が行う。morpheus-proxy に到達する traffic は plaintext(HTTP/1.1 または h2c)である
+- morpheus-proxy は ms と同一 pod 内(または同一ホスト上)で reverse proxy として動作する
+- listener と upstream は 1:1 で対応する。host / path ベースの複数宛先 routing は行わない
+- 同じ protocol の listener を複数構成することは想定しない(protocol ごとに listener は 1 つ)
+
+注意: ms 自身が mesh を経由せず直接 TLS で外部と通信する traffic(例: 外部 SaaS への HTTPS)は istio でも morpheus でも復号できないため、inspect 対象外である。
+
+### 3.3 Data plane
 
 Data plane は受け取った proxy traffic を処理する。
 
 - HTTP/1.1 request / response
-- HTTP/2 request / response
+- HTTP/2 (h2c) request / response
 - gRPC unary / streaming
-- TCP passthrough / CONNECT traffic
 
-Data plane のデフォルト動作は「何もしないで透過転送」である。ルールが一致した場合だけ、mock、fault injection、delay、drop、response manipulation などを行う。
+Data plane のデフォルト動作は「何もしないで透過転送」である。ルールが一致した場合だけ、mock、fault injection、delay、request / response manipulation などを行う。
 
-### 3.2 Control plane
+### 3.4 Control plane
 
-Control plane は管理 API と Web UI を提供する。
+Control plane は管理 API と Web UI を提供する。管理 API は proxy listener とは独立した専用の admin port でのみ公開する。proxy listener 上では管理 API を公開しない。これにより実サービス traffic と管理 traffic は完全に分離され、実サービスの path と管理 API の path が衝突することはない。
 
-- 既定の管理 base path は `/_morpheus`
-- 管理 API は `/_morpheus/api/v1/*`
-- Web UI は `/_morpheus/`
-- health endpoint は `/_morpheus/healthz`
+- 管理 base path は設定可能とし、既定は `/_morpheus`
+- 管理 API は `<basePath>/api/v1/*`
+- Web UI は `<basePath>/`(React SPA を static 配信)
+- health endpoint は `<basePath>/healthz/live` と `<basePath>/healthz/ready`
 
-管理 API は管理用ポートで公開する。HTTP proxy listener でも同じ base path を有効化できるが、安全のため初期設定では管理用ポートのみで公開する。
-
-### 3.3 Listener モード
+### 3.5 Listener モード
 
 | モード | 用途 | inspect / intercept |
 | --- | --- | --- |
-| `http` | HTTP/1.1 reverse proxy | header/path/body/response の inspect と変更が可能 |
-| `http2` | HTTP/2 reverse proxy | header/path/body/response の inspect と変更が可能 |
-| `grpc` | gRPC over HTTP/2 | metadata/path/message/trailer/grpc-status の inspect と変更が可能 |
-| `connect` | HTTP CONNECT proxy | CONNECT request の inspect は可能。encrypted payload は byte log のみ |
-| `tcp` | raw TCP forward | connection metadata のみ。L7 rule は適用不可 |
+| `http` | HTTP/1.1 / HTTP/2 (h2c) reverse proxy | header/path/body/response の inspect と変更が可能 |
+| `grpc` | gRPC over HTTP/2 (h2c) | metadata/path/message/trailer/grpc-status の inspect と変更が可能 |
 
-HTTP / gRPC の payload を inspect / modify するには、proxy が L7 protocol を解釈できる listener を使う必要がある。
-L7 rule は `http` / `http2` / `grpc` listener に限定する。`connect` / `tcp` listener では connection metadata と header 相当の情報だけを扱い、payload の matcher / manipulator は適用しない。
+- `http` listener は HTTP/1.1 と HTTP/2 (h2c) を受け付け、可能なら自動判別する
+- rule の `protocol: "http"` は HTTP/1.1 / HTTP/2 の両方に適用される
+- L7 rule は `http` / `grpc` listener のみに適用される
 
 ## 4. Core Specification
 
-### 4.1 デフォルト転送
+### 4.1 デフォルト転送と proxy 基盤動作
 
-- ルール未設定時は、受け取った request を upstream にそのまま転送し、upstream response をそのまま client に返す
+#### 4.1.1 転送の透過性
+
+明示的な rule が一致しない限り、proxy は traffic を一切変更しない。upstream response は status code、header、body を変換せずそのまま client に返す。
+
+- 転送時に header は原則そのまま維持する。`X-Forwarded-For` / `Via` などの proxy header は付与しない
+- hop-by-hop header(`Connection`、`Keep-Alive`、`Proxy-Connection`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`)は RFC 9110 に従い、転送する接続に合わせて処理する
+- `Host` / `:authority` は書き換えずそのまま upstream に送る
+- HTTP/1.1 chunked trailer、HTTP/2 trailer は passthrough する
+- WebSocket / `Upgrade` request は rule 適用対象外とし、バイト単位で passthrough する
+- 本仕様で挙動が言及されていない traffic / 要素は、原則として何もせず passthrough する
+- rule 未設定時は body を buffer せず streaming で転送する
+- upstream への接続は keep-alive / connection pool で再利用してよい(実装詳細)
+
+#### 4.1.2 Upstream 障害時の応答
+
+upstream から response が返った場合は、その内容が error であってもそのまま返す(変換しない)。upstream から response 自体を得られなかった場合のみ、proxy が以下の response を生成する。
+
+| 障害 | HTTP | gRPC |
+| --- | --- | --- |
+| 接続失敗(connection refused / DNS 解決失敗) | `502 Bad Gateway` | `grpc-status: 14 UNAVAILABLE` |
+| upstream timeout | `504 Gateway Timeout` | `grpc-status: 4 DEADLINE_EXCEEDED` |
+| 転送中の connection reset | `502 Bad Gateway`(response 未送出時) | `grpc-status: 14 UNAVAILABLE`(trailer 未送出時) |
+
+- proxy 生成 response には header `x-morpheus-error: <reason>` を付与する
+- response header 送出後に upstream との接続が切れた場合は、client との接続も切断する(途中から proxy が response を捏造しない)
+- これらは traffic log に `outcome: "upstream_error"` として記録する
+
+#### 4.1.3 Trace id
+
+- 透過転送時も request ごとに request id を生成または継承し、traffic log と proxy 生成 response の metadata に関連付ける
+
+#### 4.1.4 ログ保存の基本方針
+
 - capture / intercepted traffic の request / response metadata はログ保存対象である
-- body payload は capture 用 matcher に一致した、または intercept / manipulation された traffic だけ保存する
+- body payload は capture 用 rule に一致した、または intercept / manipulation された traffic だけ保存する
 - unmatched passthrough traffic は traffic log に保存しない
-- proxy が protocol を解釈できない場合は connection metadata を保存し、payload body は保存しない
-- 透過転送時も trace id / request id を生成または継承し、ログと response metadata に関連付ける
+- log 書き込みは非同期に行い、request 処理をブロックしない
 
 ### 4.2 管理 API
 
-管理 API は JSON over HTTP とする。base path は `/_morpheus/api/v1` とする。
+管理 API は JSON over HTTP とする。base path は `<basePath>/api/v1`(既定 `/_morpheus/api/v1`)とする。以降の例は既定 base path で記載する。
 
-#### 4.2.1 Health
+#### 4.2.1 共通仕様
+
+Content-Type:
+
+- request / response とも `application/json`(body を持つ場合)
+
+エラーレスポンス形式(全 endpoint 共通):
+
+```json
+{
+  "error": {
+    "code": "rule_validation_failed",
+    "message": "match.pattern is not a valid regular expression",
+    "details": [
+      {
+        "path": "match.pattern",
+        "reason": "invalid_regex"
+      }
+    ]
+  }
+}
+```
+
+HTTP status の使い分け:
+
+| status | 用途 |
+| --- | --- |
+| `400` | validation error、malformed request |
+| `404` | 対象 resource が存在しない |
+| `409` | revision conflict |
+| `500` | proxy internal error |
+
+Pagination(list 系 endpoint 共通):
+
+- cursor 方式とする: `?limit=50&cursor=<opaque>`
+- `limit` の既定は 50、最大は 200
+- response は `{ "items": [...], "nextCursor": "<opaque>" | null }`
+- log の list は新しい順に返す
+- rule の list は件数が少ない前提で pagination を適用せず全件返す
+
+認証:
+
+- 管理 API に認証は設けない(非目標参照)。既定 bind は `127.0.0.1` とし、必要な場合のみ config で変更する
+
+#### 4.2.2 Health
 
 ```text
-GET /_morpheus/healthz
+GET /_morpheus/healthz/live
+GET /_morpheus/healthz/ready
+```
+
+- `live`: プロセスが応答可能なら `200`
+- `ready`: 全 listener の bind が完了し、config / rule preset / descriptor の初期 load が完了していれば `200`、そうでなければ `503`
+
+#### 4.2.3 Status
+
+```text
 GET /_morpheus/api/v1/status
 ```
 
@@ -98,16 +212,15 @@ GET /_morpheus/api/v1/status
 - log retention 設定
 - script sandbox の状態
 
-#### 4.2.2 Rule CRUD
+#### 4.2.4 Rule CRUD
 
 ```text
 GET    /_morpheus/api/v1/rules
 POST   /_morpheus/api/v1/rules
 GET    /_morpheus/api/v1/rules/:id
 PUT    /_morpheus/api/v1/rules/:id
-PATCH  /_morpheus/api/v1/rules/:id
 DELETE /_morpheus/api/v1/rules/:id
-POST   /_morpheus/api/v1/rules:replace
+POST   /_morpheus/api/v1/rules:disable-all
 POST   /_morpheus/api/v1/rules:validate
 POST   /_morpheus/api/v1/rules:simulate
 POST   /_morpheus/api/v1/rules:export
@@ -120,18 +233,46 @@ POST   /_morpheus/api/v1/rules:import
 - rule update は atomic に行う
 - validation に失敗した rule は反映しない
 - rule set には単調増加する `revision` を付与する
-- update API は `expectedRevision` を受け取り、古い UI からの上書きを防ぐ
+- `PUT` / `DELETE` / `rules:import` / `rules:disable-all` は `expectedRevision` を受け取り、古い UI からの上書きを防ぐ
 - `expectedRevision` が現在の rule revision と一致しない場合は `409 Conflict` を返し、client に rule reload を促す
-- `DELETE` は既定では logical delete ではなく即時削除とする
+- `DELETE` は logical delete ではなく即時削除とする
 - 一時停止したい場合は `enabled: false` に更新する
+- `rules:disable-all` は全 rule を `enabled: false` にする(UI の one-click disable all と対応)
+- `rules:validate` は rule 定義(単体または配列)を受け取り、登録せずに validation 結果(error / warning の一覧)だけを返す。UI の保存前チェックに使う
 
-`rules:simulate`:
+#### 4.2.5 Rule state
 
-- 既存 traffic log に対して現在の rule set、または編集中の rule draft を適用した場合の結果を返す
-- request body / response body を使った simulation には、事前に capture 用 matcher を設定して対象 traffic を logging しておく必要がある
-- counter は消費しない
+```text
+GET  /_morpheus/api/v1/rules/:id/state
+POST /_morpheus/api/v1/rules/:id/state:reset
+```
+
+state は以下を返す。
+
+```json
+{
+  "ruleId": "rule-503-three-times",
+  "hits": 3,
+  "consumed": 3,
+  "remaining": 0,
+  "lastMatchedAt": "2026-06-10T00:00:03.000Z"
+}
+```
+
+- `state:reset` は hit count と consume counter を初期化する
+- rule の update / delete でも counter は初期化される
+
+#### 4.2.6 Simulation
+
+```text
+POST /_morpheus/api/v1/rules:simulate
+```
+
+- 保存済み traffic log、または request body で与えた sample request に対して、現在の rule set または編集中の rule draft を適用した場合の結果を返す
+- request body / response body を使った simulation には、事前に capture 用 rule を設定して対象 traffic を logging しておくか、`sampleRequest` / `sampleResponse` を与える必要がある
+- consume counter は消費しない
 - upstream には送信しない
-- response body は実際には変更せず、どの matcher が一致し、どの action が選択され、どの field が変更されるかを返す
+- traffic は実際には変更せず、どの rule が一致し、どの action が選択され、どの field が変更されるかを返す
 - script matcher / manipulator は sandbox 内で実行し、error / timeout は simulation result と application log に記録する
 
 Simulation request 例:
@@ -141,20 +282,18 @@ Simulation request 例:
   "logIds": ["2026-06-10T00-00-00.000Z-000001"],
   "ruleDraft": {
     "id": "draft-rule",
-    "enabled": true,
-    "priority": 100,
     "protocol": "http",
-    "phase": "response",
     "match": {
       "type": "regex",
       "field": "path",
       "pattern": "^/users"
     },
-    "action": {
-      "type": "response_replace",
-      "target": "body",
-      "from": "real",
-      "to": "mock"
+    "response": {
+      "action": {
+        "type": "script_manipulator",
+        "language": "javascript",
+        "source": "return { body: ctx.response.body.replace('real', 'mock') };"
+      }
     }
   },
   "options": {
@@ -163,87 +302,157 @@ Simulation request 例:
 }
 ```
 
-#### 4.2.3 Rule state
+Sample request による simulation 例:
 
-```text
-GET  /_morpheus/api/v1/rules/:id/state
-POST /_morpheus/api/v1/rules/:id/state:reset
+```json
+{
+  "sampleRequest": {
+    "protocol": "http",
+    "method": "GET",
+    "path": "/users/1",
+    "headers": { "x-test": "1" },
+    "body": "{}"
+  },
+  "sampleResponse": {
+    "statusCode": 200,
+    "headers": { "content-type": "application/json" },
+    "body": "{\"name\":\"real-user\"}"
+  }
+}
 ```
 
-消費型 fault injection の残回数、hit count、last matched timestamp などを確認・reset する。
+入力の規則:
 
-#### 4.2.4 Log API
+- `logIds` と `sampleRequest` はどちらか一方を必須とする(両方指定は `400`)
+- `sampleResponse` は `sampleRequest` と併用し、response 段階の simulation に使う。省略時は request 段階のみ simulate する
+- `ruleDraft` を省略した場合は現在の rule set を適用する
+- log に body が保存されていない場合、body を参照する matcher / action の simulation 結果は `skipped: body_not_logged` とする
+
+#### 4.2.7 Import / Export
+
+```text
+POST /_morpheus/api/v1/rules:export
+POST /_morpheus/api/v1/rules:import
+```
+
+rule は on-memory で永続化されないため、import / export が rule と script を手元に残すための正式な出入り口である。
+
+Export:
+
+- request: `{ "ids": ["rule-a", "rule-b"] }`。`ids` 省略時は全件
+- response:
+
+```json
+{
+  "formatVersion": 1,
+  "exportedAt": "2026-06-10T00:00:00.000Z",
+  "rules": [
+    { "schemaVersion": 1, "id": "rule-a", "...": "..." }
+  ]
+}
+```
+
+- rule 定義(script source を含む)を完全な形で出力する
+- 実行時 state(hits / consumed / remaining)は含めない
+- gRPC descriptor は含めない(descriptor API で別途管理する)
+- script source が export に含まれるため、script に secret を埋め込まないこと
+
+Import:
+
+- request:
+
+```json
+{
+  "mode": "merge",
+  "expectedRevision": 12,
+  "rules": [ { "schemaVersion": 1, "id": "rule-a", "...": "..." } ]
+}
+```
+
+- `mode: "merge"`: `id` が一致する rule は上書き、それ以外は追加する
+- `mode: "replace"`: 現在の rule set 全体を import 内容で置き換える
+- import 対象の全 rule を validation してから atomic に反映する。1 つでも validation に失敗した場合は `400` を返し、何も反映しない
+- import / merge で上書きされた rule の consume counter は初期化される
+
+#### 4.2.8 Log API
 
 ```text
 GET    /_morpheus/api/v1/logs
 GET    /_morpheus/api/v1/logs/:id
 GET    /_morpheus/api/v1/logs/:id/request
 GET    /_morpheus/api/v1/logs/:id/response
-GET    /_morpheus/api/v1/logs/:id/events
+GET    /_morpheus/api/v1/logs/:id/export
+GET    /_morpheus/api/v1/logs/events
 DELETE /_morpheus/api/v1/logs
 ```
 
-`GET /logs` は filter / pagination をサポートする。
-`GET /logs/:id/request` と `GET /logs/:id/response` は body log policy により body が保存されている場合だけ payload を返す。body が保存されていない場合は metadata と `bodyLogged: false` / `bodyLoggingSkippedReason` を返す。
+- `GET /logs` は filter / pagination(4.2.1)をサポートする
+- `GET /logs/:id/request` と `GET /logs/:id/response` は body log policy により body が保存されている場合だけ payload を返す。body が保存されていない場合は metadata と `bodyLogged: false` / `bodyLoggingSkippedReason` を返す
+- `GET /logs/:id/export` は 1 件の log を自己完結した JSON(metadata + 保存済み body)として出力する(6.2 参照)
+- `DELETE /logs` は全 log を削除する
+- `/logs/events` は SSE でリアルタイム log event を配信する
 
 Filter 例:
 
-- `protocol=http|grpc|tcp`
+- `protocol=http|grpc`
 - `method=GET`
 - `path=/api/users`
 - `grpcService=demo.TimeService`
 - `grpcMethod=Now`
 - `ruleId=...`
-- `outcome=passthrough|mock|fault|modified|dropped|upstream_error`
+- `outcome=captured|mock|fault|modified|delayed|upstream_error|rule_error`
 - `from` / `to`
 - `statusCode`
 - `grpcStatus`
-- `contains`
+- `contains`(保存済み metadata / body preview に対する部分一致)
 
-`/events` は SSE または WebSocket でリアルタイム log event を配信する。
+#### 4.2.9 Masking API
 
-#### 4.2.5 Replay API
-
-テスト用途では記録した request を再送したいケースが多いため、以下を提案機能として定義する。
+log の redaction(mask)設定を起動後に編集するための API。
 
 ```text
-POST /_morpheus/api/v1/logs/:id:replay
+GET /_morpheus/api/v1/logging/mask
+PUT /_morpheus/api/v1/logging/mask
 ```
 
-Replay は default disabled とし、明示的に `ENABLE_REPLAY=true` の場合のみ有効化する。再送先は元の upstream または request body で指定された override target とする。
+- `GET` は現在有効な mask 設定(headers / jsonPaths)を返す
+- `PUT` は mask 設定全体を置き換える。preset entry の削除も追加もこの API で行う
+- 起動時の初期値は config の `logging.mask`(4.13)から load する
+- 変更は on-memory のみで、プロセス再起動で config の値に戻る
 
 ### 4.3 Rule model
 
-Rule は以下の JSON model で表現する。
+Rule は以下の JSON model で表現する。`phase` フィールドは存在しない。request 段階の挙動は `request` フィールド、response 段階の挙動は `response` フィールドにそれぞれ optional に記述する。
 
 ```json
 {
+  "schemaVersion": 1,
   "id": "rule-503-three-times",
   "name": "Return 503 for first three user requests",
   "description": "Fault injection for retry test",
   "enabled": true,
   "priority": 100,
   "protocol": "http",
-  "phase": "request",
   "match": {
     "type": "regex",
     "field": "path",
     "pattern": "^/users/.*"
   },
-  "action": {
-    "type": "fault",
-    "fault": {
-      "kind": "http_response",
-      "statusCode": 503,
-      "headers": {
-        "content-type": "application/json"
-      },
-      "body": "{\"error\":\"temporary unavailable\"}"
+  "request": {
+    "action": {
+      "type": "fault",
+      "fault": {
+        "kind": "http_response",
+        "statusCode": 503,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": "{\"error\":\"temporary unavailable\"}"
+      }
     }
   },
   "consume": {
-    "limit": 3,
-    "afterExhausted": "passthrough"
+    "times": 3
   },
   "logging": {
     "capture": false
@@ -253,29 +462,93 @@ Rule は以下の JSON model で表現する。
 }
 ```
 
-`logging.capture` は通信を変更せずに対象 traffic の body を保存したい場合に使う。通常は `action.type: "passthrough"` と組み合わせ、rule 追加前の simulation 用 log を収集する。
+#### 4.3.1 フィールド定義
 
-#### 4.3.1 Rule ordering
+| field | 必須 | default | 説明 |
+| --- | --- | --- | --- |
+| `schemaVersion` | no | `1` | rule schema の version。import 互換性判定に使う |
+| `id` | no | server 生成 | `^[A-Za-z0-9_-]{1,128}$`。未指定時は server が一意な id を生成する |
+| `name` | no | `""` | 表示名 |
+| `description` | no | `""` | 説明 |
+| `enabled` | no | `true` | `false` の rule は評価しない |
+| `priority` | no | `0` | 整数。大きい rule を先に評価する |
+| `protocol` | yes | - | `http` / `grpc` |
+| `match` | yes | - | request に対する matcher(4.4) |
+| `request` | no | - | request 段階の設定。`{ delay?, action? }`(4.5) |
+| `response` | no | - | response 段階の設定。`{ match?, delay?, action? }`(4.5) |
+| `consume` | no | なし | 消費設定(4.6)。未指定時は一致するたびに適用する |
+| `logging` | no | `{ "capture": false }` | `capture: true` で対象 traffic の body を保存する |
+| `createdAt` / `updatedAt` | server 管理 | - | server が設定する |
 
-- `enabled: false` の rule は評価しない
+構造の規則:
+
+- `request.action` に指定できる action: `mock_response` / `fault` / `request_rewrite`
+- `response.action` に指定できる action: `fault` / `response_replace` / `script_manipulator`
+- `request` / `response` の両方を持つ rule は、request 送信前に `request` を適用し、upstream response 受信後に `response` を適用する
+- `response` の適用対象は、この rule の `match` に一致した request に対応する response だけである。他の request / response には影響しない
+- `response.match` は upstream response に対する追加条件(optional)。一致しない場合、response 段階は何もしない
+- `request.action` が `mock_response` または `fault` の場合、upstream に転送しないため upstream response は存在しない。この場合 `response` は適用されない(terminal な `request.action` と `response` を併記した rule は validation warning とする)
+- `request` / `response` のどちらも持たない rule は `logging.capture: true` が必須である(capture 専用 rule)。どちらもなく capture もない rule は validation error とする
+
+`logging.capture` は通信を変更せずに対象 traffic の body を保存したい場合に使う。rule 追加前に simulation 用 log を収集する用途を想定する。
+
+#### 4.3.2 Rule evaluation
+
+rule は以下の 2 種類に分類される。
+
+- **observation rule**: `request` / `response` を持たない rule(capture 専用)。何個一致してもよく、評価を停止しない
+- **intercept rule**: `request` または `response` を持つ rule。1 つの request / response に対して最初に一致した 1 つだけを適用する(1 request / response につき改変は 1 action)
+
+評価アルゴリズム:
+
+```text
+onRequest(req):
+  rules = currentRuleSet             # この request の処理中は revision を固定する
+            .filter(enabled && protocol == listener.protocol)
+            .sortBy(priority desc, createdAt asc)
+  interceptRule = null
+  for rule in rules:
+    if !evalMatch(rule.match, req): continue
+    if rule.consume && !tryConsume(rule):   # 消費しきった rule は
+      continue                              # 一致しなかったものとして次の rule を評価する
+    recordHit(rule)
+    if rule is observation:
+      markCapture(req, rule)                # 評価は継続する
+      continue
+    interceptRule = rule                    # 最初に一致した intercept rule で確定
+    break
+
+  if interceptRule?.request?.delay: applyDelay()
+  if interceptRule?.request?.action:
+    result = apply(interceptRule.request.action)
+    if result is mock_response or fault:
+      return respondToClient(result)        # upstream へ転送しない。response 段階も実行しない
+    # request_rewrite の場合は書き換えた request を転送する
+
+  resp = forwardToUpstream(req)
+
+onResponse(resp):
+  if interceptRule?.response:
+    if interceptRule.response.match && !evalMatch(interceptRule.response.match, resp):
+      return respondToClient(resp)          # 追加条件に不一致なら何もしない
+    if interceptRule.response.delay: applyDelay()
+    if interceptRule.response.action: resp = apply(interceptRule.response.action)
+  return respondToClient(resp)
+```
+
+規則のまとめ:
+
 - `priority` が大きい rule を先に評価する
-- priority が同じ場合は `updatedAt` が古い rule を先に評価する
-- 初期仕様では最初に一致した terminal action を実行する
-- 複数 action を連鎖させる場合は `action.type: "pipeline"` を使う
-
-#### 4.3.2 Rule phase
-
-| phase | 意味 |
-| --- | --- |
-| `request` | upstream に転送する前に評価する。mock / fault / drop / delay / request rewrite が可能 |
-| `response` | upstream response を受け取った後に評価する。response rewrite / response fault が可能 |
-| `both` | request と response の両方を評価する |
-
-Mock response と connection drop は request phase で完結し、upstream へ転送しない。
+- `priority` が同じ場合は `createdAt` が早い rule を先に評価する(`updatedAt` は評価順に影響しない)
+- 消費型 rule が消費しきっている場合、その rule はスキップされ、次に一致する rule(より低い priority の rule を含む)が適用される。どの rule にも一致しなければ passthrough する
+- observation rule は non-terminal であり、後続 rule の評価を止めない
+- intercept rule は最初に一致した 1 つだけが適用される。intercept rule に一致した traffic は traffic log に記録されるため、より低い priority の capture rule に到達しなくても traffic の検証は可能である
+- proxy が生成した response(mock / fault / upstream error)には response 段階の rule を適用しない
+- 複数の改変を 1 つの request / response に適用したい場合は、1 つの rule の中で `request` と `response` を併用するか、script manipulator で複数の変更をまとめて行う
 
 ### 4.4 Matcher
 
-Matcher は簡易 matcher と script matcher の 2 種類をサポートする。
+Matcher は簡易 matcher と script matcher の 2 種類をサポートする。`match`(request 対象)と `response.match`(response 対象)の両方で同じ matcher 構造を使うが、参照できる field が異なる。
 
 #### 4.4.1 簡易 regex matcher
 
@@ -290,12 +563,11 @@ Matcher は簡易 matcher と script matcher の 2 種類をサポートする�
 }
 ```
 
-対応 field:
+Request matcher(`match`)で使える field:
 
 | field | HTTP | gRPC | 備考 |
 | --- | --- | --- | --- |
 | `method` | yes | no | HTTP method |
-| `scheme` | yes | yes | `http` / `https` |
 | `host` | yes | yes | Host または `:authority` |
 | `path` | yes | yes | HTTP path または gRPC `:path` |
 | `query` | yes | no | query string |
@@ -304,15 +576,27 @@ Matcher は簡易 matcher と script matcher の 2 種類をサポートする�
 | `rawBodyBase64` | yes | yes | binary payload |
 | `grpc.service` | no | yes | `/package.Service/Method` から抽出 |
 | `grpc.method` | no | yes | `/package.Service/Method` から抽出 |
-| `grpc.status` | no | yes | response phase のみ |
+
+Response matcher(`response.match`)で使える field:
+
+| field | HTTP | gRPC | 備考 |
+| --- | --- | --- | --- |
+| `status` | yes | no | HTTP status code(文字列化して regex match、例 `^5\\d\\d$`) |
+| `header.<name>` | yes | yes | response header / gRPC initial metadata |
+| `body` | yes | limited | text / json / decoded gRPC message |
+| `rawBodyBase64` | yes | yes | binary payload |
+| `grpc.status` | no | yes | trailer の grpc-status |
+| `grpc.trailer.<name>` | no | yes | gRPC trailer |
 
 制約:
 
-- body matching は capture limit 内の payload のみ対象とする
+- request matcher に response 系 field(またはその逆)を指定した rule は validation error とする
+- body matching は body buffering limit(4.8.3)内の payload のみ対象とする
 - HTTP binary body は既定では base64 文字列に対して match する
 - gzip など圧縮 body は `decodeBody: true` の listener でのみ展開して match する
 - gRPC message body は descriptor が登録されていれば JSON 化した message に match できる
 - gRPC message body は descriptor がない場合、matcher / manipulator / UI preview の対象にしない
+- streaming と判定された gRPC method では body 系 field(`body` / `rawBodyBase64`)を含む matcher は評価せず不一致として扱う(4.7.5)
 
 #### 4.4.2 複合 matcher
 
@@ -346,6 +630,7 @@ Matcher は簡易 matcher と script matcher の 2 種類をサポートする�
 {
   "type": "script",
   "language": "javascript",
+  "timeoutMs": 3000,
   "source": "return ctx.request.path.startsWith('/users') && ctx.request.headers['x-test'] === '1';"
 }
 ```
@@ -360,12 +645,11 @@ type Matcher = (ctx: MatchContext) => boolean | Promise<boolean>;
 
 ```ts
 type MatchContext = {
-  protocol: 'http' | 'grpc' | 'tcp';
-  phase: 'request' | 'response';
+  protocol: 'http' | 'grpc';
+  stage: 'request' | 'response';
   request: {
     id: string;
     method?: string;
-    scheme?: string;
     host?: string;
     path?: string;
     query?: string;
@@ -398,42 +682,77 @@ type MatchContext = {
 };
 ```
 
-Security:
+- `ctx.response` は `response.match` として実行される場合(`stage: 'response'`)のみ存在する
+
+Security / 実行制御:
 
 - script matcher / manipulator は初期仕様からサポートする
-- script は proxy 本体とは別の sandbox subprocess で実行する
+- script は proxy 本体とは別の sandbox subprocess(Node.js)で実行する
 - sandbox では `fs` / `net` / `process` / filesystem access / dynamic import を禁止する
-- 1 回の実行 timeout は既定 5 分とする
+- 1 回の実行 timeout は rule ごとに `timeoutMs` で設定できる。既定は 3 秒(config `script.defaultTimeoutMs`)。ユーザーが明示的に設定した場合はその値に従う(上限は config `script.maxTimeoutMs`、既定 60 秒)
 - script の compile error / runtime error / timeout は rule execution failure として traffic log と application log の両方に残す
 - script error / timeout が発生した場合、その rule は request / response を編集せず passthrough する
 - script timeout または freeze を検知した場合、該当 sandbox subprocess を停止し、新しい sandbox subprocess を起動する
 - app 側では script の CPU / memory 上限は設けず、必要に応じて実行環境側で制御する
 - script source は log と export に含まれるため、secret を埋め込まない
 
-### 4.5 Actions
+### 4.5 段階設定と Action
 
-#### 4.5.1 Passthrough
+`request` / `response` の各段階は以下の構造を持つ。
 
-```json
-{
-  "type": "passthrough"
-}
+```ts
+type RequestStage = {
+  delay?: Delay;
+  action?: RequestAction;   // mock_response | fault | request_rewrite
+};
+
+type ResponseStage = {
+  match?: Matcher;          // upstream response への追加条件
+  delay?: Delay;
+  action?: ResponseAction;  // fault | response_replace | script_manipulator
+};
 ```
 
-明示的に何もしない。rule の match 計測や simulation 目的で使う。
+- `delay` と `action` はそれぞれ optional である。`delay` だけの段階(遅延のみ)も、`action` だけの段階も有効である
+- ただし `request` / `response` を指定する場合は `delay` か `action` の少なくとも一方を含めること。空 object(`"request": {}` など)は validation error とする
+- 「delay + 改変」のような複合挙動は、同じ段階に `delay` と `action` を並べて表現する。action を多段に連鎖させる pipeline 機構は設けない(1 request / response につき改変は 1 action)
 
-#### 4.5.2 Delay
+#### 4.5.1 Delay
 
 ```json
 {
-  "type": "delay",
   "durationMs": 500
 }
 ```
 
-request phase では upstream 転送前に遅延する。response phase では client 返却前に遅延する。
+```json
+{
+  "durationMs": 3000,
+  "mode": "total"
+}
+```
 
-#### 4.5.3 Fault
+| mode | 適用可能な段階 | 意味 |
+| --- | --- | --- |
+| `fixed`(既定) | request / response | 指定時間だけ追加で遅延する |
+| `total` | response のみ | proxy が request を受理してから client へ response を返し始めるまでの合計時間が `durationMs` になるように遅延を調整する |
+
+`total` mode の詳細:
+
+- 合計時間には「proxy → upstream の転送時間 + upstream の処理時間 + upstream → proxy の応答到達時間」が含まれる。proxy はそれらの実測経過時間を `durationMs` から差し引いた残り時間だけ遅延する
+- 実測経過時間がすでに `durationMs` 以上の場合、追加の遅延は行わず即座に返す。このとき log に `delaySkipped: true` を記録する
+- client timeout の精密なテストを想定した mode である
+- `total` を request 段階に指定した rule は validation error とする
+- streaming response では response header を client へ返す前に遅延を適用する(`total` の終点は response header 送出開始とする)
+
+適用位置:
+
+- request 段階: upstream への転送前に遅延する
+- response 段階: client への返却前に遅延する
+
+#### 4.5.2 Fault
+
+request 段階に指定した場合は upstream へ転送せず即座に応答を生成する。response 段階に指定した場合は upstream response を破棄して応答を差し替える。
 
 HTTP fault:
 
@@ -479,18 +798,33 @@ Connection fault:
 }
 ```
 
+Timeout fault:
+
+```json
+{
+  "type": "fault",
+  "fault": {
+    "kind": "timeout",
+    "durationMs": 30000
+  }
+}
+```
+
 Fault kind:
 
 | kind | HTTP | gRPC | 説明 |
 | --- | --- | --- | --- |
-| `http_response` | yes | no | upstream に転送せず指定 HTTP response を返す |
-| `grpc_status` | no | yes | upstream に転送せず指定 gRPC status を返す |
-| `timeout` | yes | yes | upstream または client への返却を timeout させる |
-| `connection` | yes | yes | connection close / reset |
-| `latency` | yes | yes | delay action と同等だが fault として記録する |
-| `bandwidth` | yes | limited | response を指定 rate で返す |
+| `http_response` | yes | no | 指定した HTTP response を返す |
+| `grpc_status` | no | yes | 指定した gRPC status を返す(HTTP status は `200`、trailer で `grpc-status` を返す) |
+| `connection` | yes | yes | `mode: "close"` は正常 close、`mode: "reset"` は TCP RST |
+| `timeout` | yes | yes | 応答を返さず接続を保留し、`durationMs` 経過後に connection close する。`durationMs` 省略時は client が切断するまで無応答を維持する |
 
-#### 4.5.4 Mock response
+- `timeout` fault で保留中の接続は idle timeout(4.11)の対象外とするが、max concurrent connections にはカウントする
+- `grpc_status` fault の `status` は 0-16 の整数。message body を伴わない fault は descriptor なしでも登録できる(4.7.3)
+
+#### 4.5.3 Mock response
+
+request 段階専用。upstream へ転送せず指定した response を返す。
 
 HTTP mock:
 
@@ -527,9 +861,10 @@ gRPC mock:
 }
 ```
 
-gRPC mock response は descriptor がある場合のみ JSON mapping または textproto を protobuf binary に encode する。descriptor がない場合、body を伴う mock response は登録不可とし、`grpc-status` / `grpc-message` のみを返す fault injection に限定する。
+- gRPC mock response は descriptor がある場合のみ JSON mapping または textproto を protobuf binary に encode する。descriptor がない場合、body を伴う mock response は登録不可とし、`grpc-status` / `grpc-message` のみを返す fault injection に限定する
+- gRPC mock は unary method のみ対象とする(streaming method への mock 登録は validation error)
 
-#### 4.5.5 Request rewrite
+#### 4.5.4 Request rewrite
 
 ```json
 {
@@ -541,47 +876,60 @@ gRPC mock response は descriptor がある場合のみ JSON mapping または t
       "value": "retry"
     },
     {
+      "op": "remove_header",
+      "name": "x-remove-me"
+    },
+    {
+      "op": "set_path",
+      "value": "/v2/users"
+    },
+    {
+      "op": "set_query",
+      "value": "debug=true"
+    },
+    {
       "op": "replace_body",
-      "from": "old",
-      "to": "new"
+      "from": "\"env\":\"prod\"",
+      "to": "\"env\":\"test\""
     }
   ]
 }
 ```
 
-Request rewrite は upstream に送る前に適用する。ログには original request と forwarded request の両方を保存する。
+- `set_header` / `remove_header` / `set_path` / `set_query` / `replace_body` をサポートする
+- `replace_body` の `from` は正規表現、`to` は置換文字列(capture group 参照 `$1` 可)。text body のみ対象とする
+- Request rewrite は upstream に送る前に適用する。ログには original request と forwarded request の両方を保存する
+- 書き換え後の request に対して他の rule を再評価することはない
 
-#### 4.5.6 Response replace
+#### 4.5.5 Response replace
 
-簡易 response manipulation として、文字列置換をサポートする。
+response 段階専用の簡易置換。対象は response header(gRPC では initial metadata)のみとする。
 
 ```json
 {
   "type": "response_replace",
-  "from": "real-value",
-  "to": "mock-value",
-  "target": "body"
+  "target": "header.x-data-source",
+  "from": "^real-(.*)$",
+  "to": "mock-$1"
 }
 ```
 
-`target`:
+- `target` は `header.<name>` 形式のみサポートする
+- `from` は正規表現、`to` は置換文字列(capture group 参照 `$1` 可)
+- 対象 header が複数値を持つ場合は各値に適用する
+- 対象 header が存在しない場合は何もしない
+- body / gRPC trailer / gRPC message の変更は script manipulator(4.5.6)で行う
 
-- `body`
-- `header.<name>`
-- `grpc.message`
-- `grpc.trailer.<name>`
+#### 4.5.6 Script manipulator
 
-Body replace は text body のみ既定有効。binary body や encoded gRPC message の置換は descriptor / encoding 設定が必要である。
-
-#### 4.5.7 Script manipulator
-
-元 request と元 response を受け取り、加工済み response を返す manipulator 関数を登録できる。
+response 段階専用。元 request と upstream response を受け取り、response への patch を返す manipulator 関数を登録できる。
 
 ```json
 {
   "type": "script_manipulator",
   "language": "javascript",
-  "source": "ctx.response.body = ctx.response.body.replace('real', 'mock'); return ctx.response;"
+  "timeoutMs": 3000,
+  "source": "return { body: ctx.response.body.replace('real', 'mock') };"
 }
 ```
 
@@ -590,7 +938,7 @@ Body replace は text body のみ既定有効。binary body や encoded gRPC mes
 ```ts
 type ResponseManipulator = (
   ctx: ManipulatorContext
-) => ResponsePatch | FullResponse | Promise<ResponsePatch | FullResponse>;
+) => ResponsePatch | Promise<ResponsePatch>;
 ```
 
 `ManipulatorContext`:
@@ -604,107 +952,97 @@ type ManipulatorContext = MatchContext & {
 };
 ```
 
-戻り値:
+戻り値は protocol ごとの union type とする。
 
 ```ts
-type ResponsePatch = {
+type HttpResponsePatch = {
   statusCode?: number;
   headers?: Record<string, string | string[] | null>;
   body?: string;
   rawBodyBase64?: string;
+};
+
+type GrpcResponsePatch = {
+  metadata?: Record<string, string | string[] | null>;
+  messages?: unknown[];
   grpcStatus?: number;
   grpcMessage?: string;
-  grpcTrailers?: Record<string, string | string[] | null>;
-  grpcMessages?: unknown[];
+  trailers?: Record<string, string | string[] | null>;
 };
+
+type ResponsePatch = HttpResponsePatch | GrpcResponsePatch;
 ```
 
-Security は script matcher と同じである。加えて、manipulator は body size limit を超えた response には既定では適用しない。
+Patch のセマンティクス:
 
-#### 4.5.8 Pipeline action
+- すべての field は optional である
+- 明示的に指定しなかった field は、upstream response の値を可能な限りそのまま維持する(部分 patch)
+- `headers` / `metadata` / `trailers` の value に `null` を指定した場合、その header を削除する。指定しなかった header は upstream のまま維持する
+- `body` と `rawBodyBase64` を同時に返した場合は runtime error として扱い、rule execution failure(passthrough)とする
+- protocol と patch の内容が一致しない field(HTTP response への `grpcStatus` など)は無視し、warning を log に記録する
 
-複数 action を順に適用する。
+制約:
 
-```json
-{
-  "type": "pipeline",
-  "actions": [
-    {
-      "type": "delay",
-      "durationMs": 200
-    },
-    {
-      "type": "response_replace",
-      "from": "real",
-      "to": "mock",
-      "target": "body"
-    }
-  ]
-}
-```
+- Security / timeout は script matcher(4.4.3)と同じである
+- body size limit を超えた response には既定では適用しない(4.8.3)
+- gRPC streaming では `messages` を含む patch は適用せず warning を記録する。`metadata` / `trailers` / `grpcStatus` / `grpcMessage` のみ適用できる(4.7.5)
 
-Pipeline 内で terminal action が発生した場合、それ以降の action は実行しない。
+### 4.6 消費型 rule
 
-Terminal action:
-
-- `mock_response`
-- `fault` with `http_response`
-- `fault` with `grpc_status`
-- `fault` with `connection`
-- `fault` with `timeout`
-
-### 4.6 消費型 fault injection
-
-消費型 fault injection は「最初の N 回だけ失敗し、その後は正常に戻る」などのテストに使う。
+消費型設定は fault injection に限らず、mock、request / response 改変を含むすべての rule に付けられる。「最初の N 回だけ適用し、その後は次の rule 評価または正常系へ戻る」テストに使う。
 
 ```json
 {
   "consume": {
-    "limit": 3,
-    "afterExhausted": "passthrough"
+    "times": 3
   }
 }
 ```
 
+| field | 必須 | 説明 |
+| --- | --- | --- |
+| `times` | yes | 適用回数の上限。1 以上の整数 |
+| `resetAfterMs` | no | 最後に消費されてから指定時間が経過すると counter を初期状態に戻す |
+
 Consume state:
 
 - 消費 counter は `rule.id` ごとに同一 process 内で管理する
-- 同じ fault injection を並列テストで分離したい場合、ユーザは matcher 側で test id や header value を条件に含め、別 rule として定義する
+- 同じ rule を並列テストで分離したい場合、ユーザは matcher 側で test id や header value を条件に含め、別 rule として定義する
 - proxy は `rule.id` 以外の per-user / per-header counter key は初期仕様では提供しない
-- `consume` が未指定の場合は消費しない。matcher に一致するたびに action を実行する
+- `consume` が未指定の場合は消費せず、matcher に一致するたびに適用する
 - counter は rule update / delete / state reset で初期化できる
 - counter の check / decrement は `rule.id` ごとの短い critical section で行う
 - upstream 転送、response 待ち、script 実行中は consume lock を保持しない
 - 初期仕様は single process 前提とし、multi-process / multi-instance 間の counter 同期は行わない
+- 消費は rule が request 段階で一致・選択された時点で 1 回行う。`request` と `response` の両方を持つ rule でも消費は 1 request につき 1 回である
 
-`afterExhausted`:
+消費しきった後の動作(exhausted):
 
-- `passthrough`: 以後は upstream に透過転送
-- `disable_rule`: rule を自動的に `enabled: false` にする
-- `next_rule`: 次に一致する rule を評価する
-
-追加設定:
-
-- `resetAfterMs`: 一定時間後に消費状態を reset
-- `cooldownMs`: 発火後に一定時間発火させない
-- `maxHitsPerWindow`: rolling window 内の最大発火回数
+- 消費しきった rule は matcher に一致しても適用されず、rule evaluation(4.3.2)では「一致しなかった」ものとしてスキップされる
+- その結果、次に一致する rule(より低い priority の rule を含む)が適用され、どの rule にも一致しなければ upstream へ透過転送される
+- この動作は固定であり、設定項目(`afterExhausted` のようなもの)は設けない
 
 ### 4.7 gRPC handling
 
 #### 4.7.1 対応範囲
 
-- unary request / unary response
-- server streaming
-- client streaming
-- bidirectional streaming
-- metadata / trailer capture
-- grpc-status / grpc-message capture
+| 項目 | unary | streaming(server / client / bidi) |
+| --- | --- | --- |
+| metadata / path の matcher | yes | yes |
+| message body の matcher | yes(descriptor 必須) | no |
+| grpc-status / trailer の matcher(`response.match`) | yes | yes |
+| metadata の edit | yes | yes |
+| trailer / grpc-status の edit | yes | yes |
+| message body の mock / manipulation | yes(descriptor 必須) | no(passthrough 固定) |
+| delay | yes | yes |
+| `grpc_status` fault | yes | yes |
+| body logging | yes(descriptor 必須) | no |
 
-初期実装では unary を優先する。streaming request / response は body の buffering と message rewrite が難しいため、原則 passthrough する。ただし HTTP/2 header / gRPC metadata / trailer は streaming でも inspect / edit できる。
+初期実装では unary を優先する。streaming は message body の buffering / rewrite を行わず passthrough するが、HTTP/2 header / gRPC metadata / trailer / grpc-status の inspect と edit はサポートする(4.7.5)。
 
 gRPC body の表示、matcher、mock body 生成、manipulation は descriptor または `.proto` が提供されている場合のみ許可する。descriptor がない場合、proxy は protobuf binary を decode / encode できないため、body を UI に表示せず、body matcher / body manipulator / JSON mock response を許可しない。
 
-gRPC method が unary か streaming かの正確な判定も descriptor に依存する。descriptor がない場合は `content-type: application/grpc` と `:path` だけでは streaming 判定できないため、body を変更せず passthrough する。
+gRPC method が unary か streaming かの正確な判定は descriptor に依存する。descriptor がない場合は streaming 判定ができないため、body を変更せず passthrough し、metadata / trailer / status に対する操作のみ許可する。
 
 #### 4.7.2 Path parsing
 
@@ -763,20 +1101,33 @@ descriptor がない場合:
 
 - gRPC application error は HTTP status `200` と trailer `grpc-status != 0` で返す
 - transport error は connection close / reset として扱う
-- delay は request header 受信後、message 受信後、response trailer 返却前のいずれかに指定できる
+- delay の適用位置は段階で決まる: request 段階の delay は upstream への転送前、response 段階の delay は client への response 返却前(response header 送出前)に適用する
+
+#### 4.7.5 Streaming の扱い
+
+descriptor によって streaming method と判定された RPC、または descriptor がなく判定不能な RPC は以下のように扱う。
+
+- message body は buffer せず passthrough する
+- request 段階: metadata / path matcher の評価、`request_rewrite`(header 操作のみ、`replace_body` は不可)、delay、`grpc_status` / `connection` / `timeout` fault(upstream へ転送せず即時に応答)を適用できる
+- response 段階: `response.match`(`header.<name>` / `grpc.status` / `grpc.trailer.<name>`)の評価、`response_replace`(initial metadata)、script manipulator による `metadata` / `trailers` / `grpcStatus` / `grpcMessage` の patch、delay を適用できる
+- body 系 field(`body` / `rawBodyBase64`)を含む matcher は評価せず不一致として扱う
+- `messages` を含む mock / patch、`replace_body` は適用せず、rule validation 時に warning、実行時には skip として log に記録する
+- streaming の body logging は行わない(metadata / trailer / status のみ記録する)
+- response 段階の `grpc.status` / `grpc.trailer.<name>` は trailer 到達時に評価できる。trailer の書き換え(script manipulator の `trailers` / `grpcStatus` / `grpcMessage` patch)は upstream trailer を受信してから client へ返す trailer に適用する
 
 ### 4.8 HTTP handling
 
 #### 4.8.1 対応範囲
 
 - HTTP/1.1
-- HTTP/2
+- HTTP/2 (h2c)
 - request / response header
 - query string
 - text body
 - JSON body
 - binary body capture
 - compressed body capture
+- WebSocket / Upgrade は rule 適用外の byte passthrough(4.1.1)
 
 #### 4.8.2 Body decoding
 
@@ -796,7 +1147,7 @@ Body matcher / body manipulator / body logging が必要な場合だけ body を
 
 - request body buffer limit: 1 MiB
 - response body buffer limit: 1 MiB
-- 設定名: `MAX_REQUEST_BODY_BUFFER_BYTES` / `MAX_RESPONSE_BODY_BUFFER_BYTES`
+- 設定は listener ごとの `maxRequestBodyBufferBytes` / `maxResponseBodyBufferBytes`(4.13)
 
 Size 判定:
 
@@ -804,13 +1155,12 @@ Size 判定:
 - `content-length` が存在しない場合、読み込みながら byte 数を加算し、limit 超過時点で拒否する
 - HTTP request body limit 超過時は `413 Payload Too Large` を返す
 - gRPC message / body limit 超過時は `grpc-status: 8 RESOURCE_EXHAUSTED` を返す
-- response phase の manipulation で upstream response が limit を超えた場合、その response は改変せず passthrough し、limit exceeded event を log に残す
+- response 段階の manipulation で upstream response が limit を超えた場合、その response は改変せず passthrough し、limit exceeded event を log に残す
 
 Streaming:
 
 - HTTP streaming と判定できる request / response は body を buffer せず passthrough する
-- gRPC streaming は descriptor によって streaming method と判定できる場合、body を buffer せず passthrough する
-- streaming traffic でも header / metadata / trailer の inspect / edit は許可する
+- streaming traffic でも header の inspect / edit は許可する
 - streaming traffic に body matcher / body manipulator rule が設定された場合、その rule は validation warning または execution skip として扱い、body は変更しない
 
 ### 4.9 Logging
@@ -819,20 +1169,19 @@ Logging は traffic log と application log を分ける。
 
 Traffic log:
 
-- proxy を通過した request / response の metadata を記録する
-- capture 用 matcher に一致した、または intercept / manipulation された request / response の body を記録する
-- fault injection で生成した response を記録する
+- proxy を通過した capture / intercepted traffic の request / response metadata を記録する
+- capture 用 rule に一致した、または intercept / manipulation された request / response の body を記録する
+- fault injection / mock で生成した response を記録する
 - passthrough だけの unmatched traffic は traffic log に保存しない
 
 Traffic capture workflow:
 
-1. まず capture 用 matcher rule を登録する
+1. まず capture 用 rule(observation rule)を登録する
 2. capture rule に match した request / response は通信を変更せず passthrough し、body log policy に従って body を保存する
 3. 保存された traffic log に対して `rules:simulate` を実行し、追加予定の rule がどう match / manipulate するか確認する
 4. simulation 結果を確認してから、本番の fault / mock / manipulation rule を登録する
 
-Capture rule は `action.type: "passthrough"` と `logging.capture: true` を持つ通常 rule として表現する。
-Capture rule は non-terminal として扱い、後続 rule の評価を止めない。
+Capture rule は `request` / `response` を持たず `logging.capture: true` を持つ observation rule として表現する。observation rule は non-terminal として扱われ、後続 rule の評価を止めない(4.3.2)。
 
 ```json
 {
@@ -840,14 +1189,10 @@ Capture rule は non-terminal として扱い、後続 rule の評価を止め�
   "enabled": true,
   "priority": 10,
   "protocol": "http",
-  "phase": "both",
   "match": {
     "type": "regex",
     "field": "path",
     "pattern": "^/users"
-  },
-  "action": {
-    "type": "passthrough"
   },
   "logging": {
     "capture": true
@@ -858,6 +1203,7 @@ Capture rule は non-terminal として扱い、後続 rule の評価を止め�
 Application log:
 
 - proxy process の起動・停止
+- config 読み込みの warning(default fallback の発生を含む)
 - listener lifecycle
 - admin API error
 - rule validation error
@@ -866,7 +1212,7 @@ Application log:
 - protobuf decode / encode error
 - log retention error
 
-Traffic log と application log は別々の sink / file / directory に保存する。片方の retention や redaction 設定がもう片方に影響しないようにする。
+Traffic log と application log は別々の sink / file / directory に保存する。片方の retention や redaction 設定がもう片方に影響しないようにする。log 書き込みは非同期に行い、request 処理をブロックしない。
 
 #### 4.9.1 Log event model
 
@@ -917,6 +1263,23 @@ Traffic log entry は capture / intercepted / fault / mock / manipulated traffic
 }
 ```
 
+`outcome` の値:
+
+| outcome | 意味 |
+| --- | --- |
+| `captured` | observation rule による capture のみ(通信は無変更) |
+| `mock` | mock response を返した |
+| `fault` | fault injection を実行した |
+| `modified` | request / response のいずれかを改変した |
+| `delayed` | delay のみ適用した |
+| `upstream_error` | upstream 障害により proxy が response を生成した |
+| `rule_error` | script error などにより rule 適用に失敗し passthrough した |
+
+- 複数が該当する場合の優先順位は `mock` / `fault` > `modified` > `delayed` > `captured` とする(例: fault + delay は `fault`、改変 + delay は `modified`)
+- intercept rule に一致したが `response.match` が不一致で改変が行われなかった場合、outcome は `captured` とし、`matchedRules` に response 条件が不一致だった旨を記録する
+
+`loggingReason` の値: `capture_rule` / `matched_rule` / `upstream_error` / `rule_error`
+
 #### 4.9.2 保存対象
 
 - traffic metadata for capture / intercepted / fault / mock / manipulated traffic
@@ -925,22 +1288,22 @@ Traffic log entry は capture / intercepted / fault / mock / manipulated traffic
 - `logging.capture: true` の rule に一致した original request / returned response
 - intercept / manipulation された original request
 - request rewrite 後の forwarded request
-- response phase rule に一致した upstream response
+- response 段階の rule に一致した upstream response
 - client に返した returned response
-- fault injection で生成した response
+- fault injection / mock で生成した response
 - request / response manipulation 前後の差分
 - proxy internal error
 - upstream error
 - script error / timeout
 - gRPC decode / encode error
-- timing breakdown
+- timing breakdown(delay `total` mode の実測値・`delaySkipped` を含む)
 
 #### 4.9.3 Body log policy
 
 - unmatched passthrough traffic は traffic log に保存しない
 - `logging.capture: true` の rule に一致した HTTP request / response は raw body を file に保存する
 - intercept / manipulation された HTTP request / response は raw body を file に保存する
-- matcher に一致しても `logging.capture: true` がなく、action が passthrough の場合、body は保存しない
+- matcher に一致しても `logging.capture: true` がなく、改変も行われなかった場合、body は保存しない
 - request rewrite が行われた場合は original request body と forwarded request body を保存する
 - response manipulation が行われた場合は upstream response body と returned response body を保存する
 - fault injection / mock response は生成した response body を保存する
@@ -954,14 +1317,13 @@ Traffic log entry は capture / intercepted / fault / mock / manipulated traffic
 
 #### 4.9.4 Retention
 
-設定:
+Retention は config(4.13)の `logging` セクションで設定する。
 
-- `TRAFFIC_LOG_DIR`
-- `APP_LOG_DIR`
-- `TRAFFIC_LOG_MAX_ENTRIES`
-- `TRAFFIC_LOG_MAX_BYTES`
-- `TRAFFIC_LOG_RETENTION_MS`
-- `APP_LOG_RETENTION_MS`
+- `trafficLogDir` / `appLogDir`
+- `trafficMaxEntries`
+- `trafficMaxBytes`
+- `trafficRetentionMs`
+- `appRetentionMs`
 
 Retention 超過時は古い log から削除する。削除は metadata、request body、response body を一貫して扱う。
 
@@ -969,18 +1331,15 @@ Retention 超過時は古い log から削除する。削除は metadata、reque
 
 テスト用途でも credential が流れる可能性があるため、redaction をサポートする。
 
-既定 redaction 対象:
+- 既定 preset を用意し、起動時に config の `logging.mask`(4.13)から load する
+- 起動後は Masking API(4.2.9)で preset entry の削除・変更・追加ができる
+- Mask は traffic log の metadata、header、HTTP JSON body preview、gRPC decoded body に適用する
+- HTTP raw body file は完全な redaction が難しいため、保存対象を capture / intercepted traffic に限定して leak surface を小さくする
 
-- `authorization`
-- `cookie`
-- `set-cookie`
-- `x-api-key`
-- `password`
-- `token`
+既定 preset:
 
-Redaction は header と JSON body path に適用できる。HTTP raw body file は完全な redaction が難しいため、保存対象を capture/intercepted traffic に限定する。
-
-Mask 設定は起動 config の JSONC で定義する。
+- headers: `authorization`、`cookie`、`set-cookie`、`x-api-key`
+- jsonPaths: `$.password`、`$.token`、`$.credentials.*`
 
 ```jsonc
 {
@@ -993,30 +1352,20 @@ Mask 設定は起動 config の JSONC で定義する。
 }
 ```
 
-Mask は traffic log の metadata、header、HTTP JSON body preview、gRPC decoded body に適用する。HTTP raw body file は完全な redaction が難しいため、capture/intercepted body のみ保存する方針で leak surface を小さくする。
-
-### 4.10 Hot load と永続化
+### 4.10 Hot load と rule store
 
 #### 4.10.1 Hot load
 
 - 管理 API で rule が更新されると、次の request から新 rule set を使う
 - 処理中の request は開始時点の rule revision を使い続ける
-- rule compilation は反映前に行う
-- script matcher / manipulator も反映前に compile する
+- rule compilation(regex compile、script compile、schema validation)は反映前に行う
+- validation / compile に失敗した場合は何も反映しない
 
-#### 4.10.2 永続化
+#### 4.10.2 Rule store
 
-初期仕様:
-
-- rule は memory store
-- process restart で rule は消える
-
-提案仕様:
-
-- `RULE_STORE=file` の場合、rule set を JSON file に保存する
-- `RULE_STORE_PATH` で file path を指定する
-- 起動時に保存済み rule を load する
-- import / export API で test fixture として再利用できる
+- rule(script rule を含む)は memory store のみとする。process restart で rule は消える
+- rule と script を手元に残す手段として import / export API(4.2.7)を提供する。export した JSON は test fixture として再利用できる
+- 起動時の初期 rule は config の `rules.presets`(4.13)から load できる(既定は空)
 
 ### 4.11 Safety and limits
 
@@ -1028,16 +1377,15 @@ Mask は traffic log の metadata、header、HTTP JSON body preview、gRPC decod
 - max active streams
 - upstream timeout
 - idle timeout
-- script timeout
+- script default / max timeout
 - log retention
-- admin API authentication
 
-管理 API は destructive な挙動を持つため、以下を推奨する。
+セキュリティ方針:
 
-- 既定では `127.0.0.1` に bind
-- remote bind する場合は token authentication を要求
-- UI から script rule を登録する場合は明示的な confirmation を要求
-- CORS は既定 disabled
+- dev 環境での利用を前提とし、管理 API / UI の認証は設けない(非目標参照)
+- 管理 API は既定で `127.0.0.1` に bind する。remote からのアクセスが必要な場合のみ config で bind host を変更する
+- UI から script rule を登録する場合は明示的な confirmation を要求する
+- CORS、security headers などは一般的な best practice に従う。UI と管理 API は同一 origin(admin port)で提供されるため CORS は既定 disabled とする
 
 ### 4.12 Observability
 
@@ -1066,20 +1414,21 @@ Prometheus format は提案機能として `/_morpheus/metrics` でも提供で�
 
 Config 読み込み要件:
 
-- config file path は CLI option または `MORPHEUS_CONFIG` で指定する
-- config file が存在しない、読めない、JSONC parse に失敗する、schema validation に失敗する、参照 descriptor file が読めない場合、app は起動に失敗する
-- 起動失敗時は application log と stderr に理由を出し、non-zero exit code で終了する
-- config 読み込み前に `appLogDir` が確定していない場合、stderr を authoritative な失敗出力とし、application log への書き込みは best effort とする
-- env var は config path、admin token などの secret / deployment-specific override に限定する
-- env override 後の最終 config も schema validation し、失敗した場合は起動しない
+- config file path は CLI option(`--config`)または env var `MORPHEUS_CONFIG` で指定する。未指定時は working directory の `morpheus.jsonc` を探す
+- **config がなくても app は起動できる。** すべての設定値はアプリ内に hard coded default を持つ
+- リポジトリにデフォルト config ファイル(`config/default.jsonc`)を同梱する。その内容はアプリ内の hard coded default と完全に一致させる(一致することをテストで検証する)
+- config file が存在しない、読めない、JSONC parse に失敗した場合は、hard coded default 全体で起動し、warning を application log と stderr に出す
+- config の一部の key が schema validation に失敗した場合は、その key だけ hard coded default に fallback し、warning を出す。validation に成功した key はその値を使用する
+- 参照 descriptor file が読めない場合は、その descriptor だけ skip して warning を出し、起動は継続する
+- env var による override は config path などの deployment-specific な項目に限定する
 
 ```jsonc
 {
   "admin": {
     "host": "127.0.0.1",
     "port": 18081,
-    "basePath": "/_morpheus",
-    "authToken": null
+    // 実サービスの path と管理 path を混同しないよう、prefix はここで変更できる
+    "basePath": "/_morpheus"
   },
   "listeners": [
     {
@@ -1088,6 +1437,7 @@ Config 読み込み要件:
       "host": "0.0.0.0",
       "port": 18080,
       "upstream": "http://127.0.0.1:8080",
+      "decodeBody": false,
       "maxRequestBodyBufferBytes": 1048576,
       "maxResponseBodyBufferBytes": 1048576
     },
@@ -1104,11 +1454,19 @@ Config 読み込み要件:
     }
   ],
   "rules": {
-    "store": "memory"
+    // 起動時に load する rule 定義の配列。既定は空
+    "presets": []
   },
   "script": {
     "sandbox": "subprocess",
-    "timeoutMs": 300000
+    "defaultTimeoutMs": 3000,
+    "maxTimeoutMs": 60000
+  },
+  "limits": {
+    "maxConcurrentConnections": 1024,
+    "maxActiveStreams": 1024,
+    "upstreamTimeoutMs": 30000,
+    "idleTimeoutMs": 60000
   },
   "logging": {
     "trafficLogDir": "logs/morpheus-proxy/traffic",
@@ -1125,23 +1483,28 @@ Config 読み込み要件:
 }
 ```
 
+- `rules.presets` の各 entry は rule model(4.3)と同じ形式とする。validation に失敗した preset rule はその rule だけ skip して warning を出す
+- `logging.mask` は起動時の初期値であり、起動後は Masking API(4.2.9)で編集できる(on-memory)
+
 ## 5. UI Specification
 
 ### 5.1 目的
 
 UI は proxy の現在状態を可視化し、テスト中に素早く rule を作成・変更し、実 traffic と fault injection の結果を確認できる管理画面である。
 
+- React で実装し、build した静的 assets を admin server から SPA として配信する
+- UI のすべての操作は管理 API(4.2)を呼び出して行う。UI にしかできない操作を作らない
+
 ### 5.2 画面構成
 
 | 画面 | 機能 |
 | --- | --- |
 | Dashboard | listener 状態、request 数、fault 数、rule hit 数、最新 log |
-| Rules | rule 一覧、検索、enable / disable、priority 変更、状態 reset |
-| Rule Editor | matcher / action / consume 設定、script 編集、validation |
+| Rules | rule 一覧、検索、enable / disable、priority 変更、状態 reset、import / export |
+| Rule Editor | matcher / request / response / consume 設定、script 編集、validation、simulation |
 | Logs | request / response log 一覧、filter、詳細、diff、raw download |
-| Replay | log からの request replay |
 | gRPC Descriptors | descriptor 登録、service / method 確認 |
-| Settings | log retention、redaction、script sandbox 状態、admin token 状態 |
+| Settings | log retention 表示、mask 設定編集、script sandbox 状態 |
 
 ### 5.3 Rules 画面
 
@@ -1151,11 +1514,10 @@ UI は proxy の現在状態を可視化し、テスト中に素早く rule を�
 - priority
 - name
 - protocol
-- phase
 - matcher summary
-- action summary
+- request / response action summary
 - hit count
-- remaining count
+- remaining count(消費型の場合)
 - last matched
 - validation status
 - rule revision
@@ -1167,6 +1529,7 @@ UI は proxy の現在状態を可視化し、テスト中に素早く rule を�
 - edit
 - delete
 - enable / disable
+- disable all(`rules:disable-all`)
 - reset consume state
 - export selected rules
 - import rules
@@ -1184,24 +1547,22 @@ Regex matcher と built-in action をフォームで設定する。
 入力:
 
 - protocol
-- phase
-- match field
-- regex pattern
-- regex flags
-- action type
-- action arguments
-- consume setting
+- match field / regex pattern / regex flags
+- request 段階: delay / action type / action arguments
+- response 段階: response match / delay / action type / action arguments
+- consume setting(times / resetAfterMs)
+- logging.capture
 
 #### 5.4.2 Advanced mode
 
-複合 matcher、pipeline action、rule-id based consume を JSON editor で編集する。
+複合 matcher、request / response 両段階の組み合わせを JSON editor で編集する。
 
 機能:
 
 - JSON schema validation
 - format
 - validation API 実行
-- sample request に対する test match
+- sample request に対する test match(`rules:simulate` の `sampleRequest` を利用)
 - 既存 log に対する `rules:simulate` 実行
 
 #### 5.4.3 Script mode
@@ -1211,7 +1572,7 @@ Script matcher / manipulator を code editor で編集する。
 機能:
 
 - syntax highlight
-- timeout warning
+- timeout 設定(既定 3 秒)と timeout warning
 - available `ctx` type の表示
 - sample context で simulation
 - 既存 log に対する simulation
@@ -1260,12 +1621,12 @@ Filter:
 - matched rule and action trace
 - timing breakdown
 - 保存されている場合のみ raw request / response download
-- この log から matcher を生成
+- この log から matcher / rule を生成(5.7.4)
 - 現在の rule set または編集中 rule draft をこの log に適用した場合の simulation 結果
 
 #### 5.5.3 Realtime
 
-SSE または WebSocket で新規 log を streaming 表示する。UI は pause/resume を持ち、pause 中も server side の log は保持される。
+SSE で新規 log を streaming 表示する。UI は pause/resume を持ち、pause 中も server side の log は保持される。
 
 ### 5.6 Manual matcher / manipulator 登録
 
@@ -1277,71 +1638,94 @@ UI は script matcher / manipulator を登録できる。ただし以下を必�
 - script sandbox の状態、実行 timeout、body size limit を表示
 - script source が export / log に残ることを明示する
 
-### 5.7 UI で提案する補助機能
+### 5.7 UI 補助機能
 
-- rule template
-  - HTTP 500 for first N requests
-  - gRPC UNAVAILABLE for first N requests
-  - delay response
-  - replace response body string
-  - mock JSON response
-  - mock gRPC unary response
-- one-click disable all rules
-- rule hit timeline
-- log から rule を作る
-- log から matcher を生成する
-- 既存 log に rule を適用した場合の simulation
-- curl / grpcurl command の生成
-- import / export
+以下は UI の正式機能とする。いずれも管理 API の既存機能の組み合わせで実現でき、UI 専用の server 機能を必要としない。
+
+#### 5.7.1 Rule template
+
+パラメータ入力付きの rule 雛形。テンプレートを選ぶと Rule Editor に展開され、保存前に編集・validation できる。
+
+| template | パラメータ | 生成される rule |
+| --- | --- | --- |
+| HTTP 5xx for first N requests | path pattern、status code、N | request 段階 `fault(http_response)` + `consume.times: N` |
+| gRPC UNAVAILABLE for first N requests | service / method、N | request 段階 `fault(grpc_status: 14)` + `consume.times: N` |
+| Delay response (fixed) | path pattern、durationMs | response 段階 `delay(fixed)` |
+| Delay response (total) | path pattern、durationMs | response 段階 `delay(total)`(client timeout テスト用) |
+| Replace response header | path pattern、header name、from regex、to | response 段階 `response_replace` |
+| Mock JSON response | path pattern、status code、JSON body | request 段階 `mock_response` |
+| Mock gRPC unary response | service / method、JSON message | request 段階 `mock_response`(descriptor 登録済みの場合のみ選択可) |
+| Capture traffic | path pattern | observation rule(`logging.capture: true`) |
+
+#### 5.7.2 One-click disable all
+
+- 全 rule を一括で `enabled: false` にする。`POST /rules:disable-all` を呼び出す
+- 実行前に confirmation を表示する
+
+#### 5.7.3 Rule hit timeline
+
+- log API の filter(`ruleId`)を使い、rule ごとの hit を時系列チャートで表示する
+- consume 残数の推移(log entry の `matchedRules[].remaining`)も表示する
+
+#### 5.7.4 Log から rule / matcher を生成
+
+- log detail から、その request の method / path / header を元にした regex matcher の draft を生成する(path は literal escape した regex とする)
+- 「この response を mock 化」: 保存済み response body がある log から `mock_response` rule の draft を生成する
+- 生成結果は Rule Editor に draft として展開され、ユーザが編集してから保存する
+
+#### 5.7.5 curl / grpcurl command 生成
+
+- log detail から、その request を再現する `curl`(HTTP)/ `grpcurl`(gRPC)コマンド文字列を生成して clipboard にコピーできる
+- body が保存されている場合のみ body 込みのコマンドを生成する。保存されていない場合は metadata のみのコマンドを生成し、その旨を表示する
+- gRPC は descriptor が登録されている場合のみ decoded body 込みで生成できる
+
+#### 5.7.6 Import / Export
+
+- Rules 画面から export(全件 / 選択分)をファイル download、import をファイル upload で行う。API は 4.2.7 を使う
+
+#### 5.7.7 その他
+
 - dark / light theme は任意。初期は機能優先でよい
 
-## 6. 追加で考慮すべき機能提案
+## 6. 将来の機能提案
 
-### 6.1 Scenario mode
+以下は初期実装には含めないが、現行設計と互換性のある形で方向性を定義しておく。
 
-複数 rule と consume state をまとめた scenario を定義できると、E2E テストで扱いやすい。
+### 6.1 Test isolation
 
-```text
-POST /_morpheus/api/v1/scenarios/:id:start
-POST /_morpheus/api/v1/scenarios/:id:stop
-POST /_morpheus/api/v1/scenarios/:id:reset
-```
+並列テストで rule と log が衝突しないよう、test run id による namespace を導入する。
 
-例:
+- rule に optional field `testId` を追加する。`testId` を持つ rule は、request header `x-morpheus-test-id` の値が一致する場合のみ評価対象とする
+- `testId` を持たない rule は従来通りすべての traffic に適用される(global rule)
+- traffic log entry に `testId` を記録し、log API の filter に `testId=` を追加する
+- `DELETE /rules?testId=...` / `DELETE /logs?testId=...` で test run 単位の一括 cleanup を可能にする
+- consume counter は rule 単位のままとする。テストごとの分離は「test run ごとに `testId` 付き rule を登録する」運用で実現する
+- UI の Rules / Logs 画面に `testId` filter を追加する
 
-- `checkout-retry-success`
-- `payment-timeout`
-- `grpc-upstream-unavailable-first-3`
+### 6.2 Recording と fixture 化
 
-### 6.2 Test isolation
+実 traffic を record し、後続テストの mock rule として再利用する。record した request の再送(replay)は行わない(非目標)。
 
-並列テストで rule が衝突しないよう、test run id による namespace を導入する。
+- capture した log 1 件を自己完結 JSON として出力する `GET /logs/:id/export`(4.2.8)を基盤とする
+- export 形式は request / response の metadata と保存済み body を含む。HAR 互換は目指さず、morpheus 独自の flat な JSON とする
+- gRPC は descriptor が登録されている場合は decoded JSON body を含め、ない場合は metadata のみとする
+- 「log から mock rule を生成」(5.7.4)により、record した response をそのまま fixture 化できる
+- 将来的には複数 log をまとめて「path → mock response」の rule set として一括生成する bulk 変換 API(`POST /logs:generate-rules`)を検討する
 
-- request header `x-morpheus-test-id`
-- query `morpheusTestId`
-- rule namespace
-- log namespace
+### 6.3 Contract-aware validation
 
-### 6.3 Recording and replay
+descriptor / schema を登録できると、UI の body editor と validation が改善する。
 
-実 traffic を record し、後続テストで replay / mock 化する。
+- protobuf descriptor set は初期実装に含まれる(4.7.3)
+- 将来、HTTP JSON body 向けに JSON Schema / OpenAPI schema を登録できる registry(`POST /_morpheus/api/v1/schemas`)を追加する
+- 登録された schema は以下に使う: mock response body の validation、Rule Editor の body 補完・エラー表示、log detail での body の構造表示
+- schema がない場合の挙動は現行どおり(text / JSON として扱う)であり、schema 登録は任意とする
 
-- log から matcher を生成
-- HAR-like export
-- gRPC descriptor 付き export
-- response fixture として保存
+### 6.4 Failure distribution
 
-### 6.4 Contract-aware gRPC / JSON support
+固定回数(consume)に加えて、確率的 fault injection を導入する。
 
-descriptor や JSON schema を登録できると、UI の body editor と validation が改善する。
-
-- protobuf descriptor set
-- OpenAPI schema
-- JSON Schema
-
-### 6.5 Failure distribution
-
-固定回数だけでなく、確率的 fault injection もあると負荷試験に使いやすい。
+- rule に optional field `trigger` を追加する
 
 ```json
 {
@@ -1353,103 +1737,120 @@ descriptor や JSON schema を登録できると、UI の body editor と valida
 }
 ```
 
-ただし deterministic なテストでは再現性が落ちるため、seed 指定を必須にする。
-
-### 6.6 Deferred: CI integration
-
-CI integration は初期仕様では扱わない。将来必要になった場合は以下を検討する。
-
-- config file から起動時 rule load
-- admin API で readiness 待ち
-- JUnit-like fault report export
-- exit 時 log archive
-- Docker image
-
-### 6.7 Security posture
-
-管理 API と script rule は強力なので、初期仕様でも以下を明文化する。
-
-- admin bind host は既定 `127.0.0.1`
-- auth token を env var で設定可能
-- script rule は初期仕様から許可するが、必ず sandbox subprocess で実行する
-- remote admin access では auth required
-- CORS disabled
-- body logging は capture/intercepted traffic に限定し、mask 設定を JSONC config で定義する
+- `rate` は 0.0-1.0。`seed` は必須とし、deterministic な PRNG(seed + rule ごとの試行連番)で再現性を確保する
+- 評価順序: matcher 一致 → trigger 判定 → (当選時のみ)consume 消費 → 適用。trigger に外れた場合は「一致しなかった」ものとして次の rule を評価する
+- rule state API に試行数と発火数を追加する
+- seed を必須にする理由: deterministic なテストで再現性を維持するため
 
 ## 7. 実装優先度案
 
 ### 7.1 Milestone 1: Core minimum
 
-- 管理 API base path
-- rule CRUD with hot load
-- HTTP request phase regex matcher
-- HTTP mock response / fault response
-- 消費型 fault injection
-- traffic metadata log と capture/intercepted body log 保存
-- log API
+- config 読み込み(default fallback 方式)と `config/default.jsonc`
+- HTTP listener の透過転送(4.1 の proxy 基盤動作、HTTP/1.1 / h2c)
+- upstream 障害時の応答生成
+- 管理 API 基盤(共通仕様、healthz live/ready、status)
+- rule CRUD with hot load、revision / expectedRevision
+- HTTP request matcher(regex / 複合)
+- `mock_response` / `fault`(http_response / connection / timeout)
+- delay(fixed)
+- 消費型 rule(times / resetAfterMs、exhausted 時の次 rule 評価)
+- traffic metadata log と capture / intercepted body log 保存
+- log API(list / detail / delete)
 
-### 7.2 Milestone 2: HTTP response manipulation
+### 7.2 Milestone 2: Response 段階と UI
 
-- response phase matcher
-- `response_replace`
+- `response.match` と response 段階の評価
+- `response_replace`(header regex 置換)
+- response 段階 fault
+- delay `total` mode
 - request / upstream response / returned response の差分 log
-- UI Rules / Logs minimum
+- `rules:simulate`(logIds / sampleRequest)
+- import / export
+- mask preset と Masking API
+- SSE realtime log
+- UI(React SPA): Dashboard / Rules / Rule Editor(simple / advanced)/ Logs / Settings
 
 ### 7.3 Milestone 3: gRPC unary
 
-- gRPC path / metadata matcher
-- gRPC status fault
-- gRPC unary mock response
-- descriptor registry
-- gRPC log detail
+- gRPC listener と gRPC path / metadata matcher
+- `grpc_status` fault
+- descriptor registry と validation
+- gRPC unary mock response(descriptor 必須)
+- gRPC body logging / log detail
+- UI: gRPC Descriptors 画面、grpcurl 生成
 
-### 7.4 Milestone 4: Advanced controls
+### 7.4 Milestone 4: Script と streaming
 
-- script matcher
-- script manipulator
-- pipeline action
-- scenario mode
-- replay
-- import / export
-
-### 7.5 Milestone 5: Streaming and scale
-
-- gRPC streaming metadata / trailer inspect
-- streaming header / metadata edit
+- script matcher / script manipulator(sandbox subprocess、rule ごとの timeout)
+- UI Rule Editor script mode
+- gRPC streaming: metadata / trailer / grpc-status の inspect / edit、delay、grpc_status fault
 - streaming body passthrough の安定化
 - retention manager
 - metrics
-- performance limits
+- performance limits(max connections / streams)
 
 ## 8. Acceptance Criteria
 
-- ルール未設定時、HTTP request は upstream に透過転送される
+基盤動作:
+
+- ルール未設定時、HTTP request は upstream に透過転送される(header / body / status を変換しない)
 - ルール未設定時、gRPC request は upstream に透過転送される
+- upstream への接続失敗時、HTTP では `502`、gRPC では `grpc-status: 14` が返り、traffic log に `outcome: "upstream_error"` が記録される
+- config file なしで app が起動し、hard coded default で動作する
+- config の一部 key が invalid な場合、その key だけ default に fallback して起動し、warning が application log に出る
+
+Rule / hot load:
+
 - 管理 API から rule を登録すると、再起動なしで次 request から反映される
 - 管理 API から rule を削除すると、次 request から反映されなくなる
-- JSONC config の読み込み、parse、schema validation、descriptor 参照に失敗した場合、app は起動しない
+- `expectedRevision` が古い更新要求は `409` で拒否される
 - HTTP path regex rule で mock response を返せる
-- HTTP response body の文字列置換 rule を設定できる
+- HTTP response header の regex 置換 rule(`response_replace`)を設定できる
 - gRPC method matcher で grpc-status fault を返せる
-- 消費型 fault injection で最初の N 回だけ fault を返し、その後 passthrough できる
+- `response.match` により、upstream response の内容(HTTP status / grpc-status)を条件に response 段階の action を適用できる
+
+消費型:
+
+- 消費型 rule で最初の N 回だけ適用し、N+1 回目からは適用されない
+- 同じ matcher に一致する priority の異なる 2 つの rule がある場合、priority の高い rule が消費しきった後は priority の低い rule が適用される
+- どの rule にも一致しない場合は passthrough する
+- `resetAfterMs` 経過後に counter が初期化され、再び適用される
+
+Delay:
+
+- response 段階の delay(fixed)で指定時間の遅延が追加される
+- response 段階の delay(total)で、request 受理から response 返却開始までの合計時間が指定時間になる。upstream 所要時間が既に指定時間を超えている場合は追加遅延なしで返し、log に記録される
+
+Logging / simulation:
+
 - unmatched passthrough traffic は traffic log に保存されない
 - capture / intercepted traffic の request と returned response は body log policy に従って保存される
-- fault injection で生成した response も log に保存される
+- fault injection / mock で生成した response も log に保存される
 - response manipulation された場合、upstream response と returned response が保存される
-- gRPC body log / body manipulation は descriptor または `.proto` がある場合だけ許可される
-- script error / timeout 時は req/resp を編集せず passthrough し、traffic log と application log に記録される
-- 管理 API で rule 一覧、rule state、log 一覧、log 詳細を確認できる
-- capture 用 matcher rule で対象 traffic を passthrough しながら body logging できる
-- 管理 API で既存 log に rule を適用した場合の simulation を確認できる
+- capture 用 rule で対象 traffic を passthrough しながら body logging できる
+- 管理 API で既存 log または sample request に rule を適用した場合の simulation を確認できる
 - body を使った simulation は capture 済み log を入力にして実行できる
+- mask 設定が log の header / JSON body preview に適用され、Masking API で起動後に変更できる
+
+gRPC:
+
+- gRPC body log / body manipulation は descriptor または `.proto` がある場合だけ許可される
+- gRPC streaming で metadata / trailer / grpc-status の inspect / edit ができ、message body は passthrough される
+
+Script:
+
+- script matcher / manipulator の timeout は既定 3 秒で、rule ごとに変更できる
+- script error / timeout 時は req/resp を編集せず passthrough し、traffic log と application log に記録される
+
+Import / export:
+
+- rule set(script source を含む)を export し、別プロセスに import して同じ挙動を再現できる
+
+管理 API / UI:
+
+- 管理 API で rule 一覧、rule state、log 一覧、log 詳細を確認できる
+- `healthz/live` と `healthz/ready` が区別され、listener bind 完了前は `ready` が `503` を返す
 - UI で rule 一覧、log 一覧、manual matcher / manipulator 登録ができる
 - UI で revision conflict を検知し、古い rule set をベースにした保存を拒否できる
-
-## 9. 未決定事項
-
-- 管理 API を proxy listener 上でも常に公開するか、管理用ポート限定にするか
-- TLS 終端を初期実装に含めるか
-- gRPC streaming manipulation をどの milestone で扱うか
-- script sandbox にどの runtime を使うか
-- rule 永続化を初期実装に含めるか
-- UI を同一 Node.js process で配信するか、別 build artifact とするか
+- UI で実行できるすべての操作は管理 API 単体でも実行できる
