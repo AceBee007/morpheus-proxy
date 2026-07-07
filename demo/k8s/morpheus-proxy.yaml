@@ -1,0 +1,119 @@
+# morpheus-proxy deployed inside the mesh, proxying to the real ms-a over
+# HTTP and gRPC. Exercises the new HTTP/gRPC reverse-proxy implementation
+# against live cluster traffic (docs/spec.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: morpheus-proxy-config
+  namespace: morpheus-proxy-demo
+data:
+  morpheus.jsonc: |
+    {
+      // admin bound to 0.0.0.0 for in-cluster access / port-forward (dev only)
+      "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
+      "listeners": [
+        {
+          "name": "http",
+          "protocol": "http",
+          "host": "0.0.0.0",
+          "port": 18080,
+          "upstream": "http://ms-a:8080"
+        },
+        {
+          "name": "grpc",
+          "protocol": "grpc",
+          "host": "0.0.0.0",
+          "port": 15051,
+          "upstream": "h2c://ms-a:50051"
+        }
+      ],
+      "logging": {
+        "trafficLogDir": "/tmp/morpheus/traffic",
+        "appLogDir": "/tmp/morpheus/app"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: morpheus-proxy
+  namespace: morpheus-proxy-demo
+  labels:
+    app.kubernetes.io/name: morpheus-proxy
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: morpheus-proxy
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "true"
+      labels:
+        app.kubernetes.io/name: morpheus-proxy
+        app.kubernetes.io/part-of: morpheus-proxy-demo
+    spec:
+      containers:
+        - name: morpheus-proxy
+          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_OLD_REDACTED/morpheus-proxy-demo/morpheus-proxy:latest
+          imagePullPolicy: Always
+          env:
+            - name: MORPHEUS_CONFIG
+              value: /etc/morpheus/morpheus.jsonc
+          ports:
+            - name: http
+              containerPort: 18080
+            - name: admin
+              containerPort: 18081
+            - name: grpc
+              containerPort: 15051
+          readinessProbe:
+            httpGet:
+              path: /_morpheus/healthz/ready
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_morpheus/healthz/live
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /etc/morpheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: morpheus-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: morpheus-proxy
+  namespace: morpheus-proxy-demo
+  labels:
+    app.kubernetes.io/name: morpheus-proxy
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: morpheus-proxy
+  ports:
+    - name: http
+      port: 18080
+      targetPort: http
+    - name: admin
+      port: 18081
+      targetPort: admin
+    - name: grpc
+      port: 15051
+      targetPort: grpc

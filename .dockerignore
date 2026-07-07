@@ -6,3 +6,6 @@ logs/
 demo/logs/
 demo/
 tmp/
+ui/node_modules/
+ui/dist/
+.playwright-mcp/
