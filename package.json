@@ -2,18 +2,28 @@
   "name": "morpheus-proxy",
   "version": "0.1.0",
   "private": true,
-  "description": "Transparent proxy for local morpheus proxy experiments",
+  "description": "Inspect / intercept / mock / fault-injection proxy for testing environments",
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "check": "tsc --noEmit -p tsconfig.json",
-    "start": "node dist/proxy.js"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/index.js"
   },
   "engines": {
     "node": ">=24.16.0"
   },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
   "devDependencies": {
     "@types/node": "24.12.4",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true
   }
 }
