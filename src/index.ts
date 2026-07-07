@@ -20,6 +20,7 @@ import { startRetentionLoop } from './retention.js';
 import { ConsumeRegistry } from './rules/consume.js';
 import { RuleStore } from './rules/store.js';
 import { validateRule, type ValidateRuleOptions } from './rules/validate.js';
+import { ScriptSandbox } from './script/sandbox.js';
 
 async function main(): Promise<void> {
   const startedAt = new Date();
@@ -88,6 +89,15 @@ async function main(): Promise<void> {
     }
   });
 
+  // Rule scripts run in an isolated subprocess (spec 4.4.3)
+  const sandbox = new ScriptSandbox({
+    defaultTimeoutMs: config.script.defaultTimeoutMs,
+    maxTimeoutMs: config.script.maxTimeoutMs,
+    appLog,
+  });
+  const scriptRunner = sandbox.matcherRunner();
+  const manipulatorRunner = sandbox.manipulatorRunner();
+
   let ready = false;
   const listeners: StartedListener[] = [];
   for (const listenerConfig of config.listeners) {
@@ -99,6 +109,8 @@ async function main(): Promise<void> {
       trafficLog,
       appLog,
       metrics,
+      scriptRunner,
+      manipulatorRunner,
     };
     if (listenerConfig.protocol === 'http') {
       listeners.push(await startHttpListener(runtime));
@@ -123,6 +135,9 @@ async function main(): Promise<void> {
     ready: () => ready,
     startedAt,
     validateOptions,
+    scriptRunner,
+    manipulatorRunner,
+    scriptSandboxStatus: () => sandbox.status(),
     ...(existsSync(uiDir) ? { uiDir } : {}),
   });
 
@@ -146,7 +161,7 @@ async function main(): Promise<void> {
     ready = false;
     appLog.info(`received ${signal}, shutting down`);
     retention.stop();
-    void Promise.all([adminServer.close(), ...listeners.map((l) => l.close())])
+    void Promise.all([adminServer.close(), sandbox.close(), ...listeners.map((l) => l.close())])
       .then(() => trafficLog.flush())
       .then(() => appLog.flush())
       .finally(() => process.exit(0));
