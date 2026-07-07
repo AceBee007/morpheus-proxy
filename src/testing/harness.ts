@@ -3,11 +3,13 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { startAdminServer, type AdminServer } from '../admin/server.js';
 import { defaultConfig } from '../config/defaults.js';
-import type { LimitsConfig, ListenerConfig } from '../config/types.js';
+import type { LimitsConfig, ListenerConfig, MorpheusConfig } from '../config/types.js';
 import { nullLogger } from '../logging/app-log.js';
 import { MaskRegistry } from '../logging/mask.js';
 import { TrafficLogStore } from '../logging/traffic-log.js';
+import { MetricsRegistry } from '../observability/metrics.js';
 import { ConsumeRegistry } from '../rules/consume.js';
 import { RuleStore } from '../rules/store.js';
 import { validateRule } from '../rules/validate.js';
@@ -96,6 +98,8 @@ export interface TestProxy {
   ruleStore: RuleStore;
   consume: ConsumeRegistry;
   trafficLog: TrafficLogStore;
+  mask: MaskRegistry;
+  metrics: MetricsRegistry;
   listener: StartedListener;
   addRule(input: unknown): Rule;
   close(): Promise<void>;
@@ -106,6 +110,7 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
   const consume = new ConsumeRegistry();
   const ruleStore = new RuleStore({ onRuleChanged: (id) => consume.reset(id) });
   const mask = new MaskRegistry(defaultConfig().logging.mask);
+  const metrics = new MetricsRegistry();
   const trafficLog = new TrafficLogStore({
     dir: mkdtempSync(join(tmpdir(), 'morpheus-proxy-test-')),
     maxEntries: 1000,
@@ -149,6 +154,7 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
     consume,
     trafficLog,
     appLog: nullLogger(),
+    metrics,
     ...(opts.scriptRunner ? { scriptRunner: opts.scriptRunner } : {}),
     ...(opts.manipulatorRunner ? { manipulatorRunner: opts.manipulatorRunner } : {}),
   };
@@ -161,10 +167,55 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
     ruleStore,
     consume,
     trafficLog,
+    mask,
+    metrics,
     listener,
     addRule,
     close: async () => {
       await listener.close();
+    },
+  };
+}
+
+export interface TestStack extends TestProxy {
+  admin: AdminServer;
+  /** Base URL including the admin base path, e.g. http://127.0.0.1:1234/_morpheus */
+  adminUrl: string;
+  api(path: string, init?: RequestInit): Promise<Response>;
+}
+
+/** Boots the proxy plus an admin server sharing the same stores. */
+export async function startTestStack(opts: TestProxyOptions): Promise<TestStack> {
+  const proxy = await startTestProxy(opts);
+  const config: MorpheusConfig = {
+    ...defaultConfig(),
+    admin: { host: '127.0.0.1', port: 0, basePath: '/_morpheus' },
+    listeners: [proxy.runtime.listener],
+  };
+  const admin = await startAdminServer({
+    config,
+    ruleStore: proxy.ruleStore,
+    consume: proxy.consume,
+    trafficLog: proxy.trafficLog,
+    mask: proxy.mask,
+    appLog: nullLogger(),
+    metrics: proxy.metrics,
+    listeners: () => [proxy.listener],
+    ready: () => true,
+    startedAt: new Date(),
+    validateOptions: { scriptMaxTimeoutMs: 60_000 },
+    ...(opts.scriptRunner ? { scriptRunner: opts.scriptRunner } : {}),
+    ...(opts.manipulatorRunner ? { manipulatorRunner: opts.manipulatorRunner } : {}),
+  });
+  const adminUrl = `http://127.0.0.1:${admin.port}/_morpheus`;
+  return {
+    ...proxy,
+    admin,
+    adminUrl,
+    api: (path, init) => fetch(`${adminUrl}${path}`, init),
+    close: async () => {
+      await admin.close();
+      await proxy.close();
     },
   };
 }

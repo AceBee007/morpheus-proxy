@@ -104,4 +104,17 @@ export class ConsumeRegistry {
   reset(ruleId: string): void {
     this.states.delete(ruleId);
   }
+
+  /**
+   * Copies the current counters into an isolated registry. Simulation uses
+   * this so evaluation sees real remaining counts without consuming them
+   * (spec 4.2.6).
+   */
+  clone(): ConsumeRegistry {
+    const copy = new ConsumeRegistry(this.now);
+    for (const [id, state] of this.states) {
+      copy.states.set(id, { ...state });
+    }
+    return copy;
+  }
 }

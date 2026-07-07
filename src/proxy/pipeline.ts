@@ -26,6 +26,7 @@ import type {
 } from '../rules/matcher.js';
 import type { RuleStore } from '../rules/store.js';
 import type { FaultSpec, Rule, ScriptManipulatorAction } from '../rules/types.js';
+import type { MetricsRegistry } from '../observability/metrics.js';
 import { applyDelay, applyResponseReplace, applyRewriteOperations } from './actions.js';
 import {
   concatStream,
@@ -64,6 +65,7 @@ export interface ProxyRuntime {
   consume: ConsumeRegistry;
   trafficLog: TrafficLogStore;
   appLog: AppLogger;
+  metrics?: MetricsRegistry;
   scriptRunner?: ScriptMatcherRunner;
   manipulatorRunner?: ManipulatorRunner;
   now?: () => Date;
@@ -238,8 +240,16 @@ export async function handleHttpExchange(
   const writeLog = (responseDraft: MessageDraft): void => {
     const shouldLog =
       rule !== null || captureRules.length > 0 || ruleErrors.length > 0 || flags.upstreamError;
-    if (!shouldLog) return;
     const outcome = decideOutcome(flags, ruleErrors.length > 0);
+    runtime.metrics?.recordRequest(
+      shouldLog ? outcome : 'passthrough',
+      matchedRules.map((m) => m.id),
+      timing.upstreamDurationMs,
+    );
+    if (ruleErrors.length > 0) {
+      for (let i = 0; i < ruleErrors.length; i++) runtime.metrics?.recordScriptError();
+    }
+    if (!shouldLog) return;
     const draft: TrafficEventDraft = {
       startedAt,
       endedAt: now(),
