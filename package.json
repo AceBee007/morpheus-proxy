@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "build:ui": "npm --prefix ui install && npm --prefix ui run build",
+    "build:all": "npm run build && npm run build:ui",
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
