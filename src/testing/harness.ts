@@ -199,7 +199,9 @@ export interface TestStack extends TestProxy {
 }
 
 /** Boots the proxy plus an admin server sharing the same stores. */
-export async function startTestStack(opts: TestProxyOptions): Promise<TestStack> {
+export async function startTestStack(
+  opts: TestProxyOptions & { ready?: () => boolean },
+): Promise<TestStack> {
   const proxy = await startTestProxy(opts);
   const config: MorpheusConfig = {
     ...defaultConfig(),
@@ -216,7 +218,7 @@ export async function startTestStack(opts: TestProxyOptions): Promise<TestStack>
     metrics: proxy.metrics,
     descriptors: proxy.descriptors,
     listeners: () => [proxy.listener],
-    ready: () => true,
+    ready: opts.ready ?? (() => true),
     startedAt: new Date(),
     validateOptions: {
       scriptMaxTimeoutMs: 60_000,

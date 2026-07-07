@@ -49,6 +49,16 @@ describe('health and status (spec 4.2.2-4.2.3)', () => {
     expect((await stack.api('/healthz/ready')).status).toBe(200);
   });
 
+  it('readiness returns 503 before listeners are ready (spec 4.2.2)', async () => {
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const stack = await startTestStack({ upstream: upstream.url, ready: () => false });
+    cleanups.push(() => stack.close());
+    expect((await stack.api('/healthz/live')).status).toBe(200);
+    const ready = await stack.api('/healthz/ready');
+    expect(ready.status).toBe(503);
+  });
+
   it('reports status details', async () => {
     const { stack } = await setup([captureRule('r1')]);
     const res = await stack.api('/api/v1/status');
