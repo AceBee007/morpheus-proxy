@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+node_modules/
+dist/
+logs/
+demo/
+tmp/
+ui/node_modules/
+ui/dist/
+.playwright-mcp/
+*.log
