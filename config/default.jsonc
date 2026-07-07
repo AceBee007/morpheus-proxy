@@ -1,0 +1,66 @@
+// morpheus-proxy default configuration.
+//
+// Every value below matches the hard coded defaults built into the app
+// (enforced by src/config/defaults.test.ts). The app starts with these values
+// when no config file is given; individual invalid keys also fall back to
+// these values with a warning (docs/spec.md section 4.13).
+{
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    // Change this prefix if it would collide with paths of the real service.
+    "basePath": "/_morpheus"
+  },
+  "listeners": [
+    {
+      "name": "http",
+      "protocol": "http",
+      "host": "0.0.0.0",
+      "port": 18080,
+      "upstream": "http://127.0.0.1:8080",
+      "decodeBody": false,
+      "descriptors": [],
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    },
+    {
+      "name": "grpc",
+      "protocol": "grpc",
+      "host": "0.0.0.0",
+      "port": 15051,
+      "upstream": "h2c://127.0.0.1:50051",
+      "decodeBody": false,
+      // Descriptor files are required for gRPC body decode/edit.
+      "descriptors": [],
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    }
+  ],
+  "rules": {
+    // Rule definitions loaded at startup. Empty by default.
+    "presets": []
+  },
+  "script": {
+    "sandbox": "subprocess",
+    "defaultTimeoutMs": 3000,
+    "maxTimeoutMs": 60000
+  },
+  "limits": {
+    "maxConcurrentConnections": 1024,
+    "maxActiveStreams": 1024,
+    "upstreamTimeoutMs": 30000,
+    "idleTimeoutMs": 60000
+  },
+  "logging": {
+    "trafficLogDir": "logs/morpheus-proxy/traffic",
+    "appLogDir": "logs/morpheus-proxy/app",
+    "trafficMaxEntries": 1000,
+    "trafficMaxBytes": 104857600,
+    "trafficRetentionMs": 86400000,
+    "appRetentionMs": 86400000,
+    "mask": {
+      "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+      "jsonPaths": ["$.password", "$.token", "$.credentials.*"]
+    }
+  }
+}
