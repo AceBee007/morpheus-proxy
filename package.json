@@ -15,15 +15,20 @@
     "node": ">=24.16.0"
   },
   "dependencies": {
-    "jsonc-parser": "^3.3.1"
+    "jsonc-parser": "^3.3.1",
+    "protobufjs": "^8.7.0"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
     "@types/node": "24.12.4",
     "typescript": "6.0.3",
     "vitest": "^3.2.4"
   },
   "allowScripts": {
     "esbuild@0.28.1": true,
-    "fsevents@2.3.3": true
+    "fsevents@2.3.3": true,
+    "protobufjs@7.6.5": true,
+    "protobufjs@8.7.0": true
   }
 }

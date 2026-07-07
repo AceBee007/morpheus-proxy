@@ -3,11 +3,14 @@
  * from the resolved configuration (docs/spec.md 4.13). The app always starts:
  * config problems fall back to built-in defaults with warnings.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startAdminServer, type AdminServer } from './admin/server.js';
 import { loadConfig } from './config/load.js';
+import { DescriptorRegistry } from './grpc/descriptors.js';
+import { startGrpcListener } from './grpc/grpc-listener.js';
+import { grpcBodyValidatorFor } from './grpc/rule-validation.js';
 import { AppLogger } from './logging/app-log.js';
 import { MaskRegistry } from './logging/mask.js';
 import { TrafficLogStore } from './logging/traffic-log.js';
@@ -44,9 +47,32 @@ async function main(): Promise<void> {
   const consume = new ConsumeRegistry();
   const ruleStore = new RuleStore({ onRuleChanged: (id) => consume.reset(id) });
   const metrics = new MetricsRegistry();
+  const descriptors = new DescriptorRegistry();
   const validateOptions: ValidateRuleOptions = {
     scriptMaxTimeoutMs: config.script.maxTimeoutMs,
+    grpcBodyValidator: grpcBodyValidatorFor(descriptors),
   };
+
+  // Descriptor files referenced by listeners: unreadable files are skipped
+  // with a warning; startup continues (spec 4.13)
+  for (const listenerConfig of config.listeners) {
+    for (const file of listenerConfig.descriptors) {
+      try {
+        if (file.endsWith('.proto')) {
+          descriptors.add({ name: file, format: 'proto_source', content: readFileSync(file, 'utf8') });
+        } else {
+          descriptors.add({
+            name: file,
+            format: 'descriptor_set',
+            content: readFileSync(file).toString('base64'),
+          });
+        }
+        appLog.info('descriptor loaded from config', { file });
+      } catch (err) {
+        appLog.warn(`config: descriptor file "${file}" was skipped`, { error: String(err) });
+      }
+    }
+  }
 
   // Rule presets from config: invalid entries are skipped with a warning (spec 4.13)
   config.rules.presets.forEach((preset, index) => {
@@ -65,21 +91,19 @@ async function main(): Promise<void> {
   let ready = false;
   const listeners: StartedListener[] = [];
   for (const listenerConfig of config.listeners) {
+    const runtime = {
+      listener: listenerConfig,
+      limits: config.limits,
+      ruleStore,
+      consume,
+      trafficLog,
+      appLog,
+      metrics,
+    };
     if (listenerConfig.protocol === 'http') {
-      listeners.push(
-        await startHttpListener({
-          listener: listenerConfig,
-          limits: config.limits,
-          ruleStore,
-          consume,
-          trafficLog,
-          appLog,
-          metrics,
-        }),
-      );
+      listeners.push(await startHttpListener(runtime));
     } else {
-      // gRPC listeners land in milestone 3
-      appLog.warn(`listener "${listenerConfig.name}" skipped: grpc listeners are not available yet`);
+      listeners.push(await startGrpcListener({ ...runtime, descriptors }));
     }
   }
 
@@ -94,6 +118,7 @@ async function main(): Promise<void> {
     mask,
     appLog,
     metrics,
+    descriptors,
     listeners: () => listeners,
     ready: () => ready,
     startedAt,

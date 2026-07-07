@@ -1,6 +1,6 @@
 import { PassThrough, type Readable } from 'node:stream';
-import { matcherUsesBody } from '../rules/matcher.js';
-import type { Matcher, Rule } from '../rules/types.js';
+import { matcherHasScript, matcherUsesBody } from '../rules/matcher.js';
+import type { Rule } from '../rules/types.js';
 
 /** Splices an already-consumed prefix back in front of the remaining stream. */
 export function concatStream(prefix: Buffer, rest: Readable): Readable {
@@ -17,20 +17,6 @@ export interface BodyInterest {
   need: boolean;
   /** The body should be persisted when logged (capture / intercept). */
   want: boolean;
-}
-
-function matcherHasScript(matcher: Matcher): boolean {
-  switch (matcher.type) {
-    case 'script':
-      return true;
-    case 'all':
-    case 'any':
-      return matcher.conditions.some(matcherHasScript);
-    case 'not':
-      return matcherHasScript(matcher.condition);
-    default:
-      return false;
-  }
 }
 
 function ruleNeedsRequestBody(rule: Rule): boolean {

@@ -6,6 +6,9 @@ import type { AddressInfo } from 'node:net';
 import { startAdminServer, type AdminServer } from '../admin/server.js';
 import { defaultConfig } from '../config/defaults.js';
 import type { LimitsConfig, ListenerConfig, MorpheusConfig } from '../config/types.js';
+import { DescriptorRegistry } from '../grpc/descriptors.js';
+import { startGrpcListener } from '../grpc/grpc-listener.js';
+import { grpcBodyValidatorFor } from '../grpc/rule-validation.js';
 import { nullLogger } from '../logging/app-log.js';
 import { MaskRegistry } from '../logging/mask.js';
 import { TrafficLogStore } from '../logging/traffic-log.js';
@@ -89,6 +92,10 @@ export interface TestProxyOptions {
   listener?: Partial<ListenerConfig>;
   scriptRunner?: ScriptMatcherRunner;
   manipulatorRunner?: ManipulatorRunner;
+  /** 'grpc' boots a gRPC listener instead of the HTTP one. */
+  protocol?: 'http' | 'grpc';
+  /** Pre-registered descriptors for gRPC stacks. */
+  descriptors?: DescriptorRegistry;
 }
 
 export interface TestProxy {
@@ -100,17 +107,20 @@ export interface TestProxy {
   trafficLog: TrafficLogStore;
   mask: MaskRegistry;
   metrics: MetricsRegistry;
+  descriptors: DescriptorRegistry;
   listener: StartedListener;
   addRule(input: unknown): Rule;
   close(): Promise<void>;
 }
 
-/** Boots a full HTTP proxy listener wired to in-memory stores for tests. */
+/** Boots a full proxy listener (HTTP by default, gRPC on request) for tests. */
 export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy> {
   const consume = new ConsumeRegistry();
   const ruleStore = new RuleStore({ onRuleChanged: (id) => consume.reset(id) });
   const mask = new MaskRegistry(defaultConfig().logging.mask);
   const metrics = new MetricsRegistry();
+  const descriptors = opts.descriptors ?? new DescriptorRegistry();
+  const protocol = opts.protocol ?? 'http';
   const trafficLog = new TrafficLogStore({
     dir: mkdtempSync(join(tmpdir(), 'morpheus-proxy-test-')),
     maxEntries: 1000,
@@ -120,7 +130,7 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
   });
 
   const addRule = (input: unknown): Rule => {
-    const result = validateRule(input);
+    const result = validateRule(input, { grpcBodyValidator: grpcBodyValidatorFor(descriptors) });
     if (!result.rule) {
       throw new Error(`invalid test rule: ${JSON.stringify(result.errors)}`);
     }
@@ -129,8 +139,8 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
   for (const rule of opts.rules ?? []) addRule(rule);
 
   const listenerConfig: ListenerConfig = {
-    name: 'http-test',
-    protocol: 'http',
+    name: `${protocol}-test`,
+    protocol,
     host: '127.0.0.1',
     port: 0,
     upstream: opts.upstream,
@@ -159,7 +169,10 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
     ...(opts.manipulatorRunner ? { manipulatorRunner: opts.manipulatorRunner } : {}),
   };
 
-  const listener = await startHttpListener(runtime);
+  const listener =
+    protocol === 'grpc'
+      ? await startGrpcListener({ ...runtime, descriptors })
+      : await startHttpListener(runtime);
   return {
     port: listener.port,
     url: `http://127.0.0.1:${listener.port}`,
@@ -169,6 +182,7 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
     trafficLog,
     mask,
     metrics,
+    descriptors,
     listener,
     addRule,
     close: async () => {
@@ -200,10 +214,14 @@ export async function startTestStack(opts: TestProxyOptions): Promise<TestStack>
     mask: proxy.mask,
     appLog: nullLogger(),
     metrics: proxy.metrics,
+    descriptors: proxy.descriptors,
     listeners: () => [proxy.listener],
     ready: () => true,
     startedAt: new Date(),
-    validateOptions: { scriptMaxTimeoutMs: 60_000 },
+    validateOptions: {
+      scriptMaxTimeoutMs: 60_000,
+      grpcBodyValidator: grpcBodyValidatorFor(proxy.descriptors),
+    },
     ...(opts.scriptRunner ? { scriptRunner: opts.scriptRunner } : {}),
     ...(opts.manipulatorRunner ? { manipulatorRunner: opts.manipulatorRunner } : {}),
   });

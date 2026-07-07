@@ -473,6 +473,14 @@ function parseRequestAction(
       for (let i = 0; i < operations.length; i++) {
         const op = parseRewriteOperation(operations[i], `${path}.operations[${i}]`, issues);
         if (!op) return undefined;
+        if (protocol === 'grpc' && op.op !== 'set_header' && op.op !== 'remove_header') {
+          issues.error(
+            `${path}.operations[${i}]`,
+            'grpc_rewrite_unsupported',
+            'gRPC request_rewrite supports header operations only (spec 4.7.5)',
+          );
+          return undefined;
+        }
         parsed.push(op);
       }
       return { type: 'request_rewrite', operations: parsed };

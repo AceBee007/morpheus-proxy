@@ -3,6 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { extname, join, normalize } from 'node:path';
 import type { MorpheusConfig } from '../config/types.js';
+import { DescriptorError, type DescriptorRegistry } from '../grpc/descriptors.js';
 import type { AppLogger } from '../logging/app-log.js';
 import type { MaskRegistry } from '../logging/mask.js';
 import type { TrafficLogStore } from '../logging/traffic-log.js';
@@ -42,12 +43,12 @@ export interface AdminContext {
   ready: () => boolean;
   startedAt: Date;
   validateOptions: ValidateRuleOptions;
+  descriptors: DescriptorRegistry;
   scriptRunner?: ScriptMatcherRunner;
   manipulatorRunner?: ManipulatorRunner;
   scriptSandboxStatus?: () => unknown;
   /** Directory of built UI assets; served as an SPA when present. */
   uiDir?: string;
-  /** Extra route hook (gRPC descriptors are registered here in M3). */
   extraRoutes?: Route[];
 }
 
@@ -321,6 +322,58 @@ function buildRoutes(): Route[] {
       path: '/api/v1/logs/:id/export',
       handler: async ({ res, ctx, params }) =>
         sendJson(res, 200, await exportLog(ctx, params['id'] as string)),
+    },
+    // gRPC descriptors (spec 4.7.3)
+    {
+      method: 'GET',
+      path: '/api/v1/grpc/descriptors',
+      handler: ({ res, ctx }) => sendJson(res, 200, { items: ctx.descriptors.list() }),
+    },
+    {
+      method: 'POST',
+      path: '/api/v1/grpc/descriptors',
+      handler: async ({ req, res, ctx }) => {
+        const body = await readJsonBody(req);
+        if (
+          typeof body !== 'object' ||
+          body === null ||
+          typeof (body as Record<string, unknown>)['name'] !== 'string' ||
+          typeof (body as Record<string, unknown>)['content'] !== 'string'
+        ) {
+          throw new ApiError(400, 'invalid_descriptor', 'body must contain name, format, content');
+        }
+        const record = body as { name: string; format?: unknown; content: string };
+        const format = record.format ?? 'proto_source';
+        if (format !== 'proto_source' && format !== 'descriptor_set') {
+          throw new ApiError(
+            400,
+            'invalid_descriptor',
+            'format must be "proto_source" or "descriptor_set"',
+          );
+        }
+        try {
+          const info = ctx.descriptors.add({ name: record.name, format, content: record.content });
+          ctx.appLog.info('grpc descriptor registered', { id: info.id, name: info.name });
+          sendJson(res, 201, info);
+        } catch (err) {
+          if (err instanceof DescriptorError) {
+            throw new ApiError(400, 'descriptor_validation_failed', err.message);
+          }
+          throw err;
+        }
+      },
+    },
+    {
+      method: 'DELETE',
+      path: '/api/v1/grpc/descriptors/:id',
+      handler: ({ res, ctx, params }) => {
+        const id = params['id'] as string;
+        if (!ctx.descriptors.remove(id)) {
+          throw new ApiError(404, 'descriptor_not_found', `descriptor "${id}" does not exist`);
+        }
+        ctx.appLog.info('grpc descriptor removed', { id });
+        sendJson(res, 200, { deleted: id });
+      },
     },
     // masking (spec 4.2.9)
     {

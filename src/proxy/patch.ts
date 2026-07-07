@@ -121,3 +121,106 @@ export function applyHttpResponsePatch(
   }
   return outcome;
 }
+
+export interface PatchableGrpcResponse {
+  /** Initial metadata (response headers). */
+  metadata: HeaderMap;
+  /** Decoded messages when a descriptor is available. */
+  messages?: unknown[];
+  grpcStatus: number;
+  grpcMessage?: string;
+  /** Extra trailers, excluding grpc-status/grpc-message. */
+  trailers: HeaderMap;
+}
+
+export interface GrpcPatchOutcome {
+  changed: boolean;
+  messagesChanged: boolean;
+  ignoredFields: string[];
+}
+
+function validateHeaderPatchValue(value: unknown, field: string): asserts value is Record<string, string | string[] | null> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new InvalidPatchError(`patch ${field} must be an object`);
+  }
+  for (const v of Object.values(value)) {
+    const ok =
+      v === null || typeof v === 'string' || (Array.isArray(v) && v.every((x) => typeof x === 'string'));
+    if (!ok) throw new InvalidPatchError(`patch ${field} values must be string, string[], or null`);
+  }
+}
+
+export interface GrpcPatchOptions {
+  /** Allow metadata changes (false once headers are already sent). */
+  allowMetadata?: boolean;
+  /** Allow message body changes (false for streaming or without descriptor). */
+  allowMessages?: boolean;
+}
+
+/**
+ * Applies a script manipulator patch to a gRPC response (spec 4.5.6).
+ * Fields inapplicable in the current context are collected as ignored.
+ */
+export function applyGrpcResponsePatch(
+  response: PatchableGrpcResponse,
+  patch: Record<string, unknown>,
+  options: GrpcPatchOptions = {},
+): GrpcPatchOutcome {
+  const allowMetadata = options.allowMetadata ?? true;
+  const allowMessages = options.allowMessages ?? true;
+  const outcome: GrpcPatchOutcome = { changed: false, messagesChanged: false, ignoredFields: [] };
+  for (const field of ['statusCode', 'body', 'rawBodyBase64', 'headers']) {
+    if (patch[field] !== undefined) outcome.ignoredFields.push(field);
+  }
+  const metadata = patch['metadata'];
+  if (metadata !== undefined) {
+    if (!allowMetadata) {
+      outcome.ignoredFields.push('metadata');
+    } else {
+      validateHeaderPatchValue(metadata, 'metadata');
+      if (applyHeaderPatch(response.metadata, metadata)) outcome.changed = true;
+    }
+  }
+  const messages = patch['messages'];
+  if (messages !== undefined) {
+    if (!allowMessages) {
+      outcome.ignoredFields.push('messages');
+    } else {
+      if (!Array.isArray(messages)) throw new InvalidPatchError('patch messages must be an array');
+      response.messages = messages;
+      outcome.changed = true;
+      outcome.messagesChanged = true;
+    }
+  }
+  const grpcStatus = patch['grpcStatus'];
+  if (grpcStatus !== undefined) {
+    if (
+      typeof grpcStatus !== 'number' ||
+      !Number.isInteger(grpcStatus) ||
+      grpcStatus < 0 ||
+      grpcStatus > 16
+    ) {
+      throw new InvalidPatchError('patch grpcStatus must be an integer 0-16');
+    }
+    if (grpcStatus !== response.grpcStatus) {
+      response.grpcStatus = grpcStatus;
+      outcome.changed = true;
+    }
+  }
+  const grpcMessage = patch['grpcMessage'];
+  if (grpcMessage !== undefined) {
+    if (typeof grpcMessage !== 'string') {
+      throw new InvalidPatchError('patch grpcMessage must be a string');
+    }
+    if (grpcMessage !== response.grpcMessage) {
+      response.grpcMessage = grpcMessage;
+      outcome.changed = true;
+    }
+  }
+  const trailers = patch['trailers'];
+  if (trailers !== undefined) {
+    validateHeaderPatchValue(trailers, 'trailers');
+    if (applyHeaderPatch(response.trailers, trailers)) outcome.changed = true;
+  }
+  return outcome;
+}

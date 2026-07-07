@@ -471,6 +471,64 @@ describe('metrics (spec 4.12)', () => {
   });
 });
 
+describe('gRPC descriptor registry API (spec 4.7.3)', () => {
+  const PROTO = `syntax = "proto3";
+package demo;
+service Echo { rpc Say (Msg) returns (Msg); }
+message Msg { string text = 1; }
+`;
+
+  it('registers, lists, and deletes proto descriptors', async () => {
+    const { stack } = await setup();
+    const created = await stack.api(
+      '/api/v1/grpc/descriptors',
+      json({ name: 'demo.proto', format: 'proto_source', content: PROTO }),
+    );
+    expect(created.status).toBe(201);
+    const info = (await created.json()) as {
+      id: string;
+      services: Array<{ fullName: string; methods: Array<{ name: string }> }>;
+    };
+    expect(info.services[0]?.fullName).toBe('demo.Echo');
+    expect(info.services[0]?.methods[0]?.name).toBe('Say');
+
+    const list = (await (await stack.api('/api/v1/grpc/descriptors')).json()) as {
+      items: unknown[];
+    };
+    expect(list.items).toHaveLength(1);
+
+    const deleted = await stack.api(`/api/v1/grpc/descriptors/${info.id}`, { method: 'DELETE' });
+    expect(deleted.status).toBe(200);
+    expect(
+      (await stack.api(`/api/v1/grpc/descriptors/${info.id}`, { method: 'DELETE' })).status,
+    ).toBe(404);
+  });
+
+  it('rejects invalid proto sources with validation errors', async () => {
+    const { stack } = await setup();
+    const res = await stack.api(
+      '/api/v1/grpc/descriptors',
+      json({ name: 'bad.proto', format: 'proto_source', content: 'not a proto {' }),
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('descriptor_validation_failed');
+  });
+
+  it('rejects descriptors that define no service', async () => {
+    const { stack } = await setup();
+    const res = await stack.api(
+      '/api/v1/grpc/descriptors',
+      json({
+        name: 'msg-only.proto',
+        format: 'proto_source',
+        content: 'syntax = "proto3"; message Lonely { string x = 1; }',
+      }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('error handling (spec 4.2.1)', () => {
   it('returns the shared error shape for unknown routes and bad JSON', async () => {
     const { stack } = await setup();

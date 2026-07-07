@@ -180,3 +180,27 @@ export function matcherUsesBody(matcher: Matcher): boolean {
     (field) => field === 'body' || field === 'rawBodyBase64',
   );
 }
+
+/** True when any part of the matcher tree is a script matcher. */
+export function matcherHasScript(matcher: Matcher): boolean {
+  switch (matcher.type) {
+    case 'script':
+      return true;
+    case 'all':
+    case 'any':
+      return matcher.conditions.some(matcherHasScript);
+    case 'not':
+      return matcherHasScript(matcher.condition);
+    default:
+      return false;
+  }
+}
+
+/** True when the matcher needs response trailers / final status (gRPC streaming). */
+export function matcherUsesTrailers(matcher: Matcher): boolean {
+  if (matcherHasScript(matcher)) return true; // scripts may inspect trailers
+  return collectMatcherFields(matcher).some(
+    (field) =>
+      field === 'grpc.status' || field === 'status' || field.startsWith('grpc.trailer.'),
+  );
+}
