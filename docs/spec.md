@@ -34,7 +34,10 @@ UI と API の関係は以下の原則に従う。
 - rule の永続化。rule / mask 設定は on-memory で保持し、プロセス再起動で失われる。import / export を代替手段として提供する
 - gRPC streaming message body の manipulation(metadata / trailer / status の inspect / edit はサポートする)
 - 記録済み request の再送(replay)
-- TCP passthrough / HTTP CONNECT proxy。対象 protocol は HTTP と gRPC のみとする
+- opaque な TCP passthrough(中身を見ないバイト転送)。対象 protocol は HTTP と gRPC のみとする。
+  なお、client の proxy 設定経由で outbound を傍受するための **inspecting な HTTP CONNECT tunnel** は
+  listener `mode: "connect"` として初期仕様でサポートする(4.14)。CONNECT で受けたトンネル内の平文
+  h2c / HTTP を inspect / manipulate してから転送するものであり、中身を見ない blind な passthrough は行わない
 - scenario mode(複数 rule のセット切り替え)
 - CI integration
 - sandbox なしで script rule を実行すること
@@ -52,31 +55,56 @@ UI と API の関係は以下の原則に従う。
 
 ### 3.2 デプロイモデル
 
-本 proxy はマイクロサービス(ms)と istio sidecar(istio-proxy)の間に挟んで使う。
+本 proxy はマイクロサービス(以下 app)と同一 pod のサイドカーコンテナとして動かし、
+istio sidecar(istio-proxy)と共存させる。TLS / mTLS の終端と暗号化は従来どおり
+istio-proxy が行い、morpheus-proxy に到達する traffic は plaintext(HTTP/1.1 または h2c)である。
+
+#### 主方式: CONNECT egress(app の outbound を傍受)
+
+app が下流サービスへ出す request / 下流からの response を inspect / manipulate する。
+既存のネットワーク設定(Service / targetPort / istio 設定 / 下流アドレス)は一切変えず、
+app には client の proxy 設定を 1 つ足すだけでよい(4.14)。
 
 ```text
-inbound:  peer service → istio-proxy (mTLS 終端) → morpheus-proxy → ms
-outbound: ms → morpheus-proxy → istio-proxy (mTLS) → peer service
+app ──(proxy設定: CONNECT)──▶ morpheus (127.0.0.1, mode:"connect") ──▶ istio-proxy (mTLS) ──▶ 下流サービス
 ```
 
-morpheus-proxy は inbound / outbound のどちらか、または両方を挟める。方向は listener の
-upstream の向き先で決まるだけで、Core は方向の区別を持たない。
+- app は proxy 設定(grpc-go の `GRPC_PROXY_ADDR` 等)で morpheus を指す。下流アドレスは据え置き
+- morpheus は CONNECT authority(`ms-b:50052` 等)をその接続の upstream として転送する。
+  1 つの listener で複数下流(ms-b / ms-c / ms-d …)を同時に傍受できる
+- app → morpheus は pod 内 loopback のため istio に捕捉されず、morpheus → 下流は pod を
+  出るため istio-proxy が mTLS 化する
+- app への inbound(peer からの request / app が返す response)には触れない
+
+#### 副方式: reverse listener(固定 upstream への転送)
+
+listener に固定 `upstream` を設定する従来型の reverse proxy 構成。CONNECT 方式で足りる
+限り不要だが、client に proxy 設定を入れられない場合や、app への inbound を挟みたい場合に使う。
+
+```text
+inbound:  peer service → istio-proxy (mTLS 終端) → morpheus-proxy → app
+outbound: app → morpheus-proxy → istio-proxy (mTLS) → 下流サービス
+```
 
 - inbound: 呼ばれる側の Service `targetPort` を morpheus に向け、morpheus の upstream を
   同一 pod の app(`http://127.0.0.1:<appPort>` / `h2c://127.0.0.1:<appPort>`)にする。
-  peer からの request / それに対する app の response を挟む。
-- outbound: app が下流サービスを呼ぶ宛先を morpheus(`127.0.0.1:<outPort>`)に向け、
-  morpheus の upstream を実際の下流サービス(`h2c://<downstream>:<port>` 等)にする。
-  app が出す request / 下流からの response を挟む。morpheus → 下流は pod を出るため
-  istio-proxy が mTLS 化する。
+  peer からの request / それに対する app の response を挟む
+- outbound(reverse): app が下流サービスを呼ぶ宛先を morpheus(`127.0.0.1:<outPort>`)に
+  向け替え、morpheus の upstream を実際の下流サービス(`h2c://<downstream>:<port>` 等)にする。
+  下流が複数ある場合は下流ごとに listener を 1 つ立て、app 側の各宛先をそれぞれに向ける
+- reverse listener と upstream は 1:1 で対応する。1 つの reverse listener は 1 つの upstream に
+  固定で転送し、host / path ベースの複数宛先 routing は行わない
 
-- TLS / mTLS の終端と暗号化は istio-proxy が行う。morpheus-proxy に到達する traffic は plaintext(HTTP/1.1 または h2c)である
-- morpheus-proxy は ms と同一 pod 内(または同一ホスト上)で reverse proxy として動作する
-- listener と upstream は 1:1 で対応する。1 つの listener は 1 つの upstream に固定で転送し、host / path ベースの複数宛先 routing は行わない
-- listener は複数構成できる(inbound / outbound、protocol ごと、下流サービスごと)。listener の `name` と `port` は一意でなければならない。同じ protocol の listener を別ポートで複数持つのは正当な構成(例: inbound gRPC と outbound gRPC)
-- 1 つの app が複数の下流サービスを呼ぶ outbound を挟む場合は、下流ごとに listener を 1 つ立て、app 側の各宛先をそれぞれの morpheus listener に向ける
+#### 共通の規則
 
-注意: ms 自身が mesh を経由せず直接 TLS で外部と通信する traffic(例: 外部 SaaS への HTTPS)は istio でも morpheus でも復号できないため、inspect 対象外である。
+- Core は方向(inbound / outbound)や mode の区別に依存しない。「listener で受けて upstream に
+  流す」だけであり、rule 評価・action・logging はどの構成でも同一に働く
+- listener は複数構成できる(mode / protocol / 下流ごと)。listener の `name` と `port` は
+  一意でなければならない。同じ protocol の listener を別ポートで複数持つのは正当な構成
+- CONNECT 方式と reverse 方式は併用できる(例: outbound は connect listener、inbound は
+  reverse listener)
+
+注意: ms 自身が mesh を経由せず直接 TLS で外部と通信する traffic(例: 外部 SaaS への HTTPS、Spanner / GCS 等の Google API client)は istio でも morpheus でも復号できないため、inspect 対象外である。`mode: "connect"` で CONNECT トンネルに通せても、トンネル内が client 終端の TLS である限り morpheus は暗号文しか見えず manipulate できない。これらのテストは各サービスの emulator / mock を使う。
 
 ### 3.3 Data plane
 
@@ -107,6 +135,9 @@ Control plane は管理 API と Web UI を提供する。管理 API は proxy li
 - `http` listener は HTTP/1.1 と HTTP/2 (h2c) を受け付け、可能なら自動判別する
 - rule の `protocol: "http"` は HTTP/1.1 / HTTP/2 の両方に適用される
 - L7 rule は `http` / `grpc` listener のみに適用される
+- 上表の `http` / `grpc` は listener の **protocol** である。これとは別に listener は ingress の **mode**
+  を持つ: `reverse`(既定、固定 upstream に転送)と `connect`(HTTP CONNECT を受け、authority を
+  upstream にする / 4.14)。どちらの mode でも上記 protocol の inspect / intercept 能力は同じ
 
 ## 4. Core Specification
 
@@ -1497,6 +1528,48 @@ Config 読み込み要件:
 
 - `rules.presets` の各 entry は rule model(4.3)と同じ形式とする。validation に失敗した preset rule はその rule だけ skip して warning を出す
 - `logging.mask` は起動時の初期値であり、起動後は Masking API(4.2.9)で編集できる(on-memory)
+- listener の `mode`(optional、既定 `reverse`)で ingress 方式を選ぶ。`mode: "connect"` の listener は `upstream` を取らない(CONNECT authority が upstream になる / 4.14)
+
+### 4.14 CONNECT egress listener(client proxy 経由の傍受)
+
+本節はデプロイモデルの主方式(3.2)である CONNECT egress listener を定義する。reverse listener(`mode` の config 既定値)は固定 upstream に転送するため、1 つの app が複数下流を呼ぶ場合は下流ごとに listener を立て、app 側の各宛先を書き換える必要がある。`mode: "connect"` は **app の宛先設定を一切変えず、outbound をまとめて 1 つの listener で傍受する**ための mode である。
+
+動作:
+
+- listener は HTTP CONNECT を受ける。app(client)は proxy 設定(grpc-go `GRPC_PROXY_ADDR`、Go `net/http` / 多くの言語の `HTTPS_PROXY`)で morpheus を指すだけでよい。下流アドレス(`ms-b:50052` 等)は据え置き
+- morpheus は `CONNECT <host:port> HTTP/1.1` を受理して `200 Connection Established` を返し、その **authority(`<host:port>`)をこの接続の upstream** とする
+- トンネル内の平文を通常の pipeline で処理する。listener の `protocol` が `grpc` なら h2c を gRPC として、`http` なら h1/h2 を自動判別して扱う。rule 評価・fault・mock・manipulation・logging・consume はすべて reverse listener と同一
+- 処理後、CONNECT authority へ転送する。morpheus → 下流は pod を出るため istio-proxy が mTLS 化する(3.2 と同じ)。traffic log の `target` にはその接続の upstream(CONNECT authority)を記録する
+- 1 つの connect listener で複数の下流(ms-b / ms-c / ms-d …)を同時に傍受できる。宛先の判別は CONNECT authority で行い、host/path ベースの routing 設定は不要
+
+制約:
+
+- **opt-in**: proxy 設定をした client の通信だけが morpheus を通る。設定しない client は素通りし傍受されない。全 outbound を漏れなく捕捉したい要件には透過捕捉(Istio `EnvoyFilter` / iptables)が必要で、それは本 proxy の対象外(2.3)
+- **平文のみ**: トンネル内が client 終端の TLS(外部 SaaS への HTTPS、Spanner / GCS 等)の場合、morpheus は暗号文を inspect / manipulate できない(3.2 注記)。このような接続は blind 中継せず、平文として解釈できない時点で fail fast する(接続確立が失敗する)。これらのサービスのテストは emulator / mock で行う
+- 上記のため、proxy 設定は process 全体の `HTTPS_PROXY` ではなく、mesh 内下流の client だけに効く専用設定(grpc-go の `GRPC_PROXY_ADDR` のような per-client 設定)を推奨する。`HTTPS_PROXY` を使う場合は外部 TLS 宛先を `NO_PROXY` で除外すること
+- CONNECT tunnel は inspect が目的であり、中身を見ない opaque な passthrough は行わない(2.3)
+- `mode: "connect"` の listener では config の `upstream` は無視する
+
+config 例:
+
+```jsonc
+{
+  "name": "grpc-egress",
+  "protocol": "grpc",
+  "host": "127.0.0.1",  // app からのみ使うため loopback
+  "port": 15052,
+  "mode": "connect"
+  // upstream は不要(CONNECT authority が upstream になる)
+}
+```
+
+app 側は下流アドレスを据え置き、proxy 設定だけ足す:
+
+```text
+GRPC_PROXY_ADDR = 127.0.0.1:15052   # grpc-go の CONNECT proxy 先 = morpheus
+MS_B_ADDR       = ms-b:50052        # 変更なし(CONNECT の宛先 = upstream になる)
+MS_C_ADDR       = ms-c:50053        # 変更なし。同じ morpheus が両方を傍受する
+```
 
 ## 5. UI Specification
 
@@ -1811,6 +1884,16 @@ descriptor / schema を登録できると、UI の body editor と validation �
 - upstream への接続失敗時、HTTP では `502`、gRPC では `grpc-status: 14` が返り、traffic log に `outcome: "upstream_error"` が記録される
 - config file なしで app が起動し、hard coded default で動作する
 - config の一部 key が invalid な場合、その key だけ default に fallback して起動し、warning が application log に出る
+
+CONNECT egress(4.14):
+
+- `mode: "connect"` の listener が HTTP CONNECT を受理し、client の下流アドレス設定を変更せずに
+  トンネル内の traffic を透過転送できる
+- CONNECT authority がその接続の upstream になり、traffic log の `target` に記録される
+- 1 つの connect listener で複数の異なる下流宛先を同時に扱える
+- connect listener 上でも rule(capture / fault / mock / manipulation / consume)が reverse
+  listener と同様に適用される
+- CONNECT 以外の request を受けた場合は `405` を返す
 
 Rule / hot load:
 

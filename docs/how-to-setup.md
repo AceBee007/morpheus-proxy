@@ -1,51 +1,44 @@
 # 既存サービスの dev 環境に morpheus-proxy を導入する手順
 
-このドキュメントは、Istio mesh 上で動く既存マイクロサービスの **dev 環境** に
-morpheus-proxy をサイドカーとして追加する手順をまとめたものです。
-demo の `ms-a` への導入実績([tmp/setup-morpheus-proxy-worklog.md](../tmp/setup-morpheus-proxy-worklog.md))を一般化しています。
+このドキュメントは、Istio mesh 上で動く既存マイクロサービス(以下 app)の **dev 環境** に
+morpheus-proxy を追加し、**app が下流サービスへ出す request / 下流からの response を
+inspect / manipulate できるようにする**手順をまとめたものです。
+demo の `ms-a` への導入実績を一般化しています(GKE + Istio 実機での検証記録は
+[verification-matrix.md](verification-matrix.md) と [tmp/setup-morpheus-proxy-worklog.md](../tmp/setup-morpheus-proxy-worklog.md))。
 
 > **対象は dev 環境のみ。** morpheus は認証を持たず、admin API から挙動を自由に変えられます。
 > 本番・ステージングには入れないでください。
 
-## 1. 仕組み(何をするか)
+## 1. 仕組み(CONNECT 方式)
 
-morpheus はサービス Pod に**もう 1 つのコンテナ**として同居する reverse proxy です。
-挟む向きは 2 つあり、**目的に応じて選びます**(両方同時も可)。morpheus の Core は
-方向の区別を持たず、「listener で受けて upstream に流す」だけです(spec 3.2)。
-
-### inbound(peer → app への通信を挟む)
-
-app が **呼ばれる側** で、外から来る request と app が返す response を扱いたいとき。
-Service の受け口(`targetPort`)を morpheus に向けます。
+morpheus はサービス Pod に**もう 1 つのコンテナ**として同居する proxy です。
+標準の導入方式は **CONNECT 方式**(spec 4.14): app は client の proxy 設定で morpheus を指し、
+**下流アドレスは一切変えません**。
 
 ```
-peer service ──(mTLS)──▶ istio-proxy ──▶ morpheus :18080/:15051 ──▶ app 127.0.0.1:<appPort>
+app ──(proxy設定: CONNECT)──▶ morpheus 127.0.0.1:15052 ──▶ istio-proxy ──(mTLS)──▶ 下流サービス
+                                   └── CONNECT の宛先(ms-b:50052 等)を読み、
+                                       rule pipeline(inspect/mock/fault/改変/capture)を通して転送
 ```
 
-### outbound(app → 下流サービスへの通信を挟む)
+ポイント:
 
-app が **呼ぶ側** で、app が下流に出す request と下流からの response を扱いたいとき
-(例: 下流の fault injection / mock / 遅延で app の挙動をテストする)。
-app の下流呼び先を morpheus(loopback)に向け替えます。
-
-```
-app ──▶ morpheus 127.0.0.1:<outPort> ──▶ istio-proxy ──(mTLS)──▶ 下流サービス
-```
-
-**どちらを選ぶか**: app の依存先(下流)を制御してテストしたいなら **outbound**。
-app 自身への入力や応答を弄りたいなら **inbound**。両方必要なら両方の listener を立てます。
-
-共通の性質:
-- ルールが無ければ morpheus は**素通し**(透過転送)。既存の挙動は変わりません。
-- ルールを入れると mock / fault injection / delay / body 改変 / capture ができます。
-- morpheus ↔ app(inbound)や app → morpheus(outbound)は Pod 内 loopback(`127.0.0.1`)なので
-  Istio に捕捉されません。morpheus → 下流(outbound)は Pod を出るので Istio が mTLS 化します。
-- listener は「1 listener = 1 upstream」。複数宛先を挟むなら**下流ごとに listener を 1 つ**立て、
-  app 側の各宛先をそれぞれの morpheus listener に向けます。
+- **既存のネットワーク設定はそのまま**: Service / targetPort / Istio 設定 / 下流アドレスは無変更。
+  変えるのは「app に proxy 設定の env を 1 つ足す」「Pod に morpheus コンテナと ConfigMap を足す」だけ
+- **1 listener で複数下流**: 宛先は CONNECT の authority(`ms-b:50052`)から分かるため、
+  下流が ms-b / ms-c / ms-d と増えても listener は 1 つでよい
+- **ルールが無ければ素通し**(透過転送)。既存の挙動は変わらない。ルールを入れると
+  mock / fault injection / delay / body 改変 / capture ができる
+- app → morpheus は Pod 内 loopback なので Istio に捕捉されず、morpheus → 下流は Pod を
+  出るので**従来どおり istio-proxy が mTLS 化**する(実機で envoy stats により確認済み)
+- **inbound(app が呼ばれる側)は対象外**: この手順では app に到達する request には一切触れない。
+  必要になった場合の reverse 方式は付録 A を参照
 
 前提:
+
 - サービスは Istio sidecar injection 済み(`sidecar.istio.io/inject: "true"`)
-- app の listen ポートが分かっている(例: HTTP `8080`、gRPC `50051`)
+- **app の gRPC/HTTP client が CONNECT proxy 設定を尊重できる**(§5。多くの言語で標準サポート、
+  または数行の dialer 追加。これが唯一の app 側変更)
 - morpheus image を pull できる Artifact Registry がある
 
 ## 2. image を用意する
@@ -77,14 +70,9 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 ## 3. ConfigMap（morpheus の設定）
 
-listener を「どの向きを挟むか」に応じて定義します。各 listener は `port`(morpheus が待ち受ける)と
-`upstream`(転送先)の 1:1 対応です。
-
-- **inbound listener**: `upstream` を同一 pod の app(`127.0.0.1:<appPort>`)にする。`host` は `0.0.0.0`
-- **outbound listener**: `upstream` を下流サービス(`<downstream>:<port>`)にする。`host` は `127.0.0.1`
-  (pod 内の app からのみ使うため loopback に固定)。下流ごとに 1 listener
-
-下記は inbound(http/grpc)+ outbound(下流 gRPC)を全部入れた例。不要な向き・protocol は削ってください。
+CONNECT 方式の listener は 1 つだけです。`mode: "connect"` を指定し、`upstream` は書きません
+(CONNECT の宛先がそのまま転送先になります)。`host` は Pod 内の app からのみ使うため
+loopback に固定します。
 
 ```yaml
 apiVersion: v1
@@ -97,35 +85,33 @@ data:
     {
       "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
-        // inbound: peer → morpheus → app(loopback)
-        { "name": "http-in", "protocol": "http", "host": "0.0.0.0", "port": 18080,
-          "upstream": "http://127.0.0.1:8080" },
-        { "name": "grpc-in", "protocol": "grpc", "host": "0.0.0.0", "port": 15051,
-          "upstream": "h2c://127.0.0.1:50051" },
-        // outbound: app(loopback) → morpheus → 下流(istio が mTLS 化)
-        { "name": "grpc-out-downstream", "protocol": "grpc", "host": "127.0.0.1", "port": 15052,
-          "upstream": "h2c://<downstream>:<port>" }
+        // app の下流呼び出し(gRPC)をまとめて受ける CONNECT egress listener
+        { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1", "port": 15052,
+          "mode": "connect" }
+        // 下流に REST(HTTP) もある場合は protocol http の connect listener を別ポートで追加:
+        // { "name": "http-egress", "protocol": "http", "host": "127.0.0.1", "port": 15053,
+        //   "mode": "connect" }
       ],
       "logging": { "trafficLogDir": "/tmp/morpheus/traffic", "appLogDir": "/tmp/morpheus/app" }
     }
 ```
 
-同じ protocol の listener を別ポートで複数持つのは正当な構成です(inbound gRPC と outbound gRPC など)。
-`name` と `port` は listener ごとに一意にしてください。
-
-恒久的に効かせたいルールがある場合は `rules.presets`（配列、要素は rule 定義）に書けます。
-ルールは on-memory で Pod 再起動時に消えるため、常設ルールは presets、実験は admin API を使い分けます。
+- `name` と `port` は listener ごとに一意にしてください
+- 恒久的に効かせたいルールがある場合は `rules.presets`（配列、要素は rule 定義）に書けます。
+  ルールは on-memory で Pod 再起動時に消えるため、常設ルールは presets、実験は admin API を使い分けます
+- gRPC の body(message)を扱うルールには descriptor 登録が必要です(spec 4.7)
 
 ## 4. Deployment にサイドカーを追加
 
 app の Deployment に morpheus コンテナと ConfigMap volume を追加します。
+公開が必要なポートは admin (18081) だけです(CONNECT listener は loopback 専用)。
 
 ```yaml
 spec:
   template:
     spec:
       containers:
-        - name: <app>            # inbound のみなら変更なし。outbound を挟むなら env を変更(下記 §6)
+        - name: <app>            # 変更は §5 の env 追加のみ
           # ...
         - name: morpheus-proxy   # ← 追加
           image: asia-northeast1-docker.pkg.dev/<PROJECT_ID>/<REPO>/morpheus-proxy:latest
@@ -134,10 +120,8 @@ spec:
             - name: MORPHEUS_CONFIG
               value: /etc/morpheus/morpheus.jsonc
           ports:
-            - { name: mp-http,  containerPort: 18080 }   # inbound http listener
-            - { name: mp-admin, containerPort: 18081 }   # admin/UI
-            - { name: mp-grpc,  containerPort: 15051 }   # inbound grpc listener
-            # outbound listener(15052 など)は loopback 専用なので containerPort に出さなくてよい
+            - { name: mp-admin, containerPort: 18081 }   # admin API / Web UI
+            # connect listener(15052)は loopback 専用なので containerPort に出さない
           readinessProbe:
             httpGet: { path: /_morpheus/healthz/ready, port: 18081 }
             initialDelaySeconds: 3
@@ -156,42 +140,35 @@ spec:
           configMap: { name: morpheus-proxy-config }
 ```
 
-## 5. inbound を挟む場合: Service の targetPort を morpheus に向ける
+Service は**変更しません**(admin/UI を in-cluster から触りたい場合のみ、任意で
+`{ name: mp-admin, port: 18081, targetPort: 18081 }` を足す)。
 
-app を「呼ばれる側」として挟むときの変更です。`port`(公開番号)はそのまま、`targetPort` を
-morpheus の inbound listener に変えます。**app コンテナ側は変更不要**(morpheus が loopback で app に転送)。
+## 5. app に proxy 設定を足す(唯一の app 側変更)
 
-```yaml
-spec:
-  ports:
-    - { name: http, port: 8080,  targetPort: 18080 }   # app 8080 → morpheus 18080
-    - { name: grpc, port: 50051, targetPort: 15051 }   # app 50051 → morpheus 15051
-    - { name: mp-admin, port: 18081, targetPort: 18081 }  # 任意: admin/UI を in-cluster 公開
-```
-
-> gRPC の Service ポート名は Istio が HTTP/2 と認識できるよう `grpc`（または `grpc-*`）にしてください。
-
-## 6. outbound を挟む場合: app の下流呼び先を morpheus に向ける
-
-app を「呼ぶ側」として挟むときの変更です。app が下流サービスを呼ぶ宛先(環境変数や config)を、
-morpheus の outbound listener(loopback)に向け替えます。**Service の targetPort は変えません**。
+app の下流アドレス(`MS_B_ADDR` 等)は**据え置き**のまま、gRPC client の dial を
+morpheus の CONNECT listener 経由にします。
 
 ```yaml
-# app コンテナの env(例: 下流 ms-b への gRPC 呼び先)
+# app コンテナの env: 下流アドレスは変えず、proxy 設定を 1 つ足すだけ
 env:
-  - name: MS_B_ADDR
-    value: "127.0.0.1:15052"     # 元: ms-b:50052 → morpheus outbound listener へ
+  - name: GRPC_PROXY_ADDR        # ← 追加(名前は app の実装に合わせる)
+    value: "127.0.0.1:15052"
+  - name: MS_B_ADDR              # 変更なし。CONNECT の宛先 = 転送先になる
+    value: "ms-b:50052"
+  - name: MS_C_ADDR              # 変更なし。同じ morpheus が全下流を傍受する
+    value: "ms-c:50053"
 ```
 
-- morpheus 側は §3 の `grpc-out-downstream`(`:15052 → h2c://<downstream>:<port>`)が受けて下流に転送します。
-- 下流が複数あるなら、下流ごとに outbound listener を増やし、app の各宛先をそれぞれに向けます。
-- app の呼び先が変更できない(ハードコード等)場合は、Istio の `EnvoyFilter` / iptables で
-  outbound を morpheus に redirect する高度な方法が必要ですが、dev では env 変更で足りるのが普通です。
+client 側の実装は 2 通りあります:
 
-inbound と outbound は併用できます(両方の listener を立て、Service targetPort と app env の両方を変更)。
-
-demo の完成形マニフェスト(inbound http/grpc + outbound grpc の全部入り)は
-[demo/k8s/ms-a-morpheus-sidecar.yaml](../demo/k8s/ms-a-morpheus-sidecar.yaml) を参照。
+1. **専用 env + dialer(推奨)**: 対象の gRPC client にだけ CONNECT dialer を差す。
+   grpc-go なら `grpc.WithContextDialer` で CONNECT する数行の dialer
+   (実装例: [demo/cmd/ms-a/main.go](../demo/cmd/ms-a/main.go) の `connectProxyDialer`)。
+   効かせる client を明示的に選べるため、外部 TLS client を巻き込む事故がない
+2. **言語標準の proxy env**: grpc-go / Go `net/http` / `@grpc/grpc-js` などは
+   `HTTPS_PROXY`(または `grpc_proxy`)を尊重する。コード変更ゼロだが **process 全体に
+   効く**ため、Spanner / GCS など外部 TLS 宛先を必ず `NO_PROXY` で除外すること
+   (除外しないとそれらの接続が失敗する。§8 制約参照)
 
 ## 6. 適用とロールアウト確認
 
@@ -201,6 +178,10 @@ kubectl --context=$CTX apply -f <your-manifest>.yaml
 kubectl --context=$CTX -n <NAMESPACE> rollout status deploy/<app>
 # Pod が app + istio-proxy + morpheus-proxy で N+1 コンテナ（例 3/3）になれば成功
 ```
+
+demo の完成形マニフェスト(CONNECT 方式、GKE + Istio で検証済み)は
+[demo/k8s/ms-a-morpheus-connect.yaml](../demo/k8s/ms-a-morpheus-connect.yaml) を参照。
+docker compose で動くローカル版は [demo/README.md](../demo/README.md)。
 
 ## 7. 動作確認
 
@@ -212,31 +193,26 @@ A=http://localhost:18081/_morpheus/api/v1
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- \
   wget -qO- http://localhost:18081/_morpheus/healthz/ready
 
-# 素通し確認: peer から通常どおり呼べる（挙動が変わらない）
-# capture ルールを入れて、通過した traffic がログに出るかで「morpheus を通っている」ことを確認
+# 1) 素通し確認: app を通常どおり使えて挙動が変わらないこと
+
+# 2) capture ルールを入れ、app が下流を呼んだ traffic がログに出ることで
+#    「morpheus を通っている」ことを確認(protocol は grpc)
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- \
   wget -qO- --header='content-type: application/json' \
-  --post-data='{"id":"cap","protocol":"http","priority":10,"match":{"type":"regex","field":"path","pattern":"^/"},"logging":{"capture":true}}' \
+  --post-data='{"id":"cap","protocol":"grpc","priority":10,"match":{"type":"regex","field":"path","pattern":"^/"},"logging":{"capture":true}}' \
   $A/rules
-# → peer からサービスを呼んだあと:
+# → app に下流呼び出しを発生させたあと:
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- "$A/logs?limit=5"
+# 各エントリの "listener":"grpc-egress" と "target":"h2c://<下流>:<port>" を確認
+
+# 3) (任意) morpheus → 下流が istio-proxy を通っている証拠: envoy の下流クラスタ統計が増える
+kubectl --context=$CTX -n <NAMESPACE> exec $POD -c istio-proxy -- \
+  pilot-agent request GET clusters | grep -E '<downstream>.*rq_total'
 ```
 
 ## 8. テストでの使い方（例）
 
-fault injection で「最初の N 回だけ 503」を再現:
-
-```sh
-kubectl exec $POD -c morpheus-proxy -- wget -qO- --header='content-type: application/json' \
-  --post-data='{"id":"flaky","protocol":"http","priority":100,
-    "match":{"type":"regex","field":"path","pattern":"^/api/orders"},
-    "request":{"action":{"type":"fault","fault":{"kind":"http_response","statusCode":503}}},
-    "consume":{"times":3}}' \
-  http://localhost:18081/_morpheus/api/v1/rules
-```
-
-outbound を挟んでいる場合は、**app が下流を呼ぶ通信**に同じルールが効きます。例えば
-下流 gRPC を「最初の 2 回だけ UNAVAILABLE」にして、app のリトライ/フォールバック挙動を試せます:
+下流 gRPC を「最初の 2 回だけ UNAVAILABLE」にして、app のリトライ/フォールバック挙動を試す:
 
 ```sh
 kubectl exec $POD -c morpheus-proxy -- wget -qO- --header='content-type: application/json' \
@@ -247,12 +223,13 @@ kubectl exec $POD -c morpheus-proxy -- wget -qO- --header='content-type: applica
   http://localhost:18081/_morpheus/api/v1/rules
 ```
 
-(demo では ms-a→ms-b の `AnimalSound` にこの手法で fault を注入し、ms-a の応答が
-最初の 2 回 502、その後正常に戻ることを確認済み。worklog の「outbound 検証」参照。)
+(demo では ms-a→ms-b の `TimeService/Now` にこの手法で fault を注入し、ms-a の応答が
+最初の 2 回 502、その後正常に戻ることを GKE + Istio 実機で確認済み。)
 
-gRPC で `grpc-status` を返す、body を mock する等は descriptor 登録が必要です
-(`POST /_morpheus/api/v1/grpc/descriptors` に `.proto` を投入)。詳細は
-[docs/spec.md](spec.md) の 4.5 / 4.7 を参照。
+他に response header の置換(`response_replace`)、response body の改変(`script_manipulator`)、
+遅延(`delay`)、mock(`mock_response`)が使えます。gRPC で body を mock / 改変する場合は
+descriptor 登録が必要です(`POST /_morpheus/api/v1/grpc/descriptors` に `.proto` を投入。
+詳細は [docs/spec.md](spec.md) の 4.5 / 4.7)。
 
 admin API / Web UI をローカルから触るには port-forward:
 
@@ -273,18 +250,40 @@ kubectl --context=$CTX -n <NAMESPACE> port-forward $POD 18081:18081
 
 ## 9. 撤去(元に戻す)
 
-inbound を挟んでいた場合は Service の `targetPort` を app のポートに戻し、outbound を
-挟んでいた場合は app の下流呼び先 env を元の値に戻します。そのうえで Deployment から
-morpheus コンテナと ConfigMap volume を外して apply します。ルールは on-memory なので状態は残りません。
+app の proxy 設定 env(`GRPC_PROXY_ADDR` 等)を外し、Deployment から morpheus コンテナと
+ConfigMap volume を外して apply するだけです。下流アドレスも Service も元から触っていないため
+他に戻すものはありません。ルールは on-memory なので状態は残りません。
 
 ## 10. 制約・注意
 
 - **dev 専用**: 認証なし。Service に admin ポートを載せる場合も mesh 内限定にすること。
-- **向きは明示的に選ぶ**: inbound は Service targetPort、outbound は app の下流呼び先 env を
-  向け替えることで挟む(§5 / §6)。両方向を同時に挟むこともできる。app が mesh を経由せず
-  直接 TLS で外部と話す通信(外部 SaaS への HTTPS 等)は Istio でも morpheus でも復号できないため対象外。
+- **opt-in**: proxy 設定を入れた client の通信だけが morpheus を通る。設定しない client は
+  素通り(傍受されない)。漏れなく捕捉したい要件には `EnvoyFilter` / iptables の透過捕捉が
+  必要だが、本 proxy の対象外(spec 2.3)。
+- **平文のみ**: トンネル内が client 終端の TLS(外部 SaaS の HTTPS、Spanner / GCS 等)だと
+  morpheus は暗号文を改変できず、blind 中継もしないため**その接続は失敗する**。
+  外部サービスのテストは emulator / mock を使う。このため proxy 設定は process 全体の
+  `HTTPS_PROXY` より**専用 env(`GRPC_PROXY_ADDR` 等)を推奨**。`HTTPS_PROXY` を使う場合は
+  外部 TLS 宛先を `NO_PROXY` で除外する(§5)。
+- **inbound は対象外**: app に到達する request / app が返す response には触れない(付録 A の
+  reverse 方式を明示的に組んだ場合のみ対象になる)。
 - **ルールは揮発**: Pod 再起動で消える。常設は `rules.presets`、共有は `rules:export` /
   `rules:import` を使う。
 - **body を扱うルールのみバッファリング**: 単純な header/path matcher や素通しでは body を
   読まない(既定 1 MiB 上限、config で変更可)。
 - **gRPC の body 操作は descriptor 必須**: 未登録なら metadata / grpc-status のみ扱える。
+
+## 付録 A: reverse 方式(参考・通常は不要)
+
+morpheus は固定 upstream へ転送する reverse listener も持ちます(spec 3.2)。CONNECT 方式で
+足りる限り不要ですが、client に proxy 設定を一切入れられない場合の代替です。
+
+- **outbound(reverse)**: 下流ごとに listener を立て(`"upstream": "h2c://<downstream>:<port>"`)、
+  app の下流アドレス env を `127.0.0.1:<listenerPort>` に**書き換える**。下流の数だけ
+  listener と env 変更が増える
+- **inbound**: Service の `targetPort` を morpheus に向け、morpheus の upstream を
+  `127.0.0.1:<appPort>` にする。app に到達する request / app が返す response を挟める
+  (本手順のスコープ外)
+
+両方式を混在させることもできます。完成形マニフェスト(inbound http/grpc + reverse outbound
+grpc の全部入り)は [demo/k8s/ms-a-morpheus-sidecar.yaml](../demo/k8s/ms-a-morpheus-sidecar.yaml) を参照。

@@ -1,47 +1,36 @@
-# Local sidecar demo
+# Local CONNECT-inspect demo
 
-This directory contains a minimal local reproduction of this request path:
+A minimal, config-driven reproduction of morpheus intercepting a service's
+**outbound** calls via an HTTP CONNECT tunnel (docs/spec.md 4.14):
 
 ```text
-client -> ms-a-istio -> morpheus-proxy -> ms-a
-ms-a -> morpheus-proxy -> ms-a-istio -> ms-b-istio -> ms-b
+client ── HTTP/gRPC ──▶ ms-a
+ms-a ──(GRPC_PROXY_ADDR, HTTP CONNECT)──▶ morpheus-proxy ──▶ ms-b
+                                             └─ inspects / mocks / faults ms-a → ms-b
 ```
 
-It uses `docker.io/istio/proxyv2` as the Envoy sidecar image. Docker Compose
-does not reproduce Kubernetes pod networking or Istio iptables capture, so
-`ms-a` explicitly connects to `morpheus-proxy:15000` with HTTP CONNECT, and the
-proxy connects to the local outbound Istio listener at `ms-a-istio:15001`.
+`ms-a` keeps its real downstream address (`MS_B_ADDR=ms-b:50052`) **unchanged** and
+only gains `GRPC_PROXY_ADDR=morpheus-proxy:15052`. grpc-go opens an HTTP CONNECT
+tunnel to morpheus for each downstream dial; morpheus reads the CONNECT authority
+(`ms-b:50052`) as the per-connection upstream, runs the rule pipeline on the
+plaintext h2c, then forwards to the real `ms-b`.
+
+morpheus is configured entirely by [morpheus.jsonc](morpheus.jsonc) via
+`MORPHEUS_CONFIG` — the same way the real app is configured (no env-var wiring).
+
+> **No istio locally.** Docker Compose has no mesh iptables capture, so the mTLS
+> hop that happens in a real k8s pod (`morpheus → istio → ms-b`) is omitted here.
+> For the in-mesh deployment see [k8s/ms-a-morpheus-connect.yaml](k8s/ms-a-morpheus-connect.yaml)
+> and spec 3.2 / 4.14.
 
 ## Services
 
-- `ms-a`: echo service
-  - HTTP: `GET /echo?message=hello` or `POST /echo`
-  - gRPC: `demo.EchoService/Echo`
-- `morpheus-proxy`: transparent Node.js proxy between `ms-a` and `ms-a-istio`
-  - TCP forward: `ms-a-istio -> morpheus-proxy -> ms-a`
-  - HTTP CONNECT: `ms-a -> morpheus-proxy -> ms-a-istio`
-  - gRPC early return: `/demo.AnimalSoundService/Sound` returns `Dummy`
-  - status UI: `http://localhost:18081`
-  - logs raw request and response bytes under `demo/logs/morpheus-proxy`
-- `ms-b`: time service
-  - gRPC: `demo.TimeService/Now`
-  - gRPC: `demo.AnimalSoundService/Sound`
-- `ms-a-istio`: inbound HTTP/gRPC to `morpheus-proxy`, outbound gRPC to `ms-b-istio`
-- `ms-b-istio`: inbound gRPC for `ms-b`
-
-Every echo response includes the echoed message and the current UTC time
-returned by `ms-b`, so the proxy and sidecar path is exercised for both HTTP and
-gRPC echo requests.
-
-The echo response `message` is formatted as:
-
-```text
-{time from ms-b} {request message} {animal sound}
-```
-
-In this Docker Compose setup, the animal sound request is early-returned by
-`morpheus-proxy`, so the animal sound is always `Dummy`. Calling `ms-b` directly
-returns a random animal sound.
+- `ms-a`: echo service (HTTP `GET/POST /echo`, gRPC `demo.EchoService/Echo`). Each
+  echo calls `ms-b` for the current time and an animal sound — both through the
+  morpheus CONNECT proxy.
+- `morpheus-proxy`: one `mode: "connect"` gRPC listener on `:15052`; admin API /
+  web UI on `:18081`.
+- `ms-b`: `demo.TimeService/Now` and `demo.AnimalSoundService/Sound`.
 
 ## Run
 
@@ -50,85 +39,81 @@ cd demo
 docker compose up --build -d
 ```
 
-The `morpheus-proxy` image builds the root TypeScript proxy with Node.js
-24.16.0 LTS and then runs the compiled ESM output.
+The `morpheus-proxy` image builds the root TypeScript proxy (Node.js 24 LTS);
+`ms-a` / `ms-b` build from `demo/` (Go).
 
-## Status UI
-
-Open:
-
-```sh
-open http://localhost:18081
-```
-
-The page streams proxy access logs in real time and keeps only the latest 100
-entries in the browser and server memory.
-
-## Verify HTTP
+## Verify (transparent forward)
 
 ```sh
 curl 'http://localhost:18080/echo?message=hello'
 ```
 
-Expected shape:
+Expected — real time from `ms-b` and a real (random) animal sound, i.e. the
+CONNECT path forwarded transparently (no rules yet):
 
 ```json
 {
-  "message": "2026-06-03T00:00:00Z hello Dummy",
+  "message": "2026-06-03T00:00:00Z hello woof",
   "upstream_time": "2026-06-03T00:00:00Z",
-  "animal_sound": "Dummy",
+  "animal_sound": "woof",
   "served_by": "ms-a",
   "protocol": "http"
 }
 ```
 
-## Verify gRPC
+gRPC echo:
 
 ```sh
 docker compose run --rm grpcurl \
-  -plaintext \
-  -import-path /proto \
-  -proto demo.proto \
-  -d '"hello"' \
-  ms-a-istio:50051 \
-  demo.EchoService/Echo
+  -plaintext -import-path /proto -proto demo.proto \
+  -d '"hello"' ms-a:50051 demo.EchoService/Echo
 ```
 
-Expected shape:
+## See morpheus intercept ms-a → ms-b
 
-```json
-{
-  "message": "2026-06-03T00:00:00Z hello Dummy",
-  "animal_sound": "Dummy",
-  "protocol": "grpc",
-  "served_by": "ms-a",
-  "upstream_time": "2026-06-03T00:00:00Z"
-}
-```
-
-## Verify ms-b random animal sound directly
+Add a capture rule, call `ms-a`, then read the traffic log — the entry proves the
+`ms-a → ms-b` gRPC went through morpheus (via CONNECT):
 
 ```sh
-docker compose run --rm grpcurl \
-  -plaintext \
-  -import-path /proto \
-  -proto demo.proto \
-  -d '{}' \
-  ms-b-istio:50052 \
-  demo.AnimalSoundService/Sound
+A=http://localhost:18081/_morpheus/api/v1
+
+# capture every gRPC request morpheus sees
+curl -s "$A/rules" -H 'content-type: application/json' -d '{
+  "id":"cap","protocol":"grpc","priority":10,
+  "match":{"type":"regex","field":"path","pattern":"^/"},
+  "logging":{"capture":true}
+}' >/dev/null
+
+curl -s 'http://localhost:18080/echo?message=viaCONNECT' >/dev/null
+curl -s "$A/logs?limit=5"   # entries with "listener":"grpc-egress","target":"h2c://ms-b:50052"
 ```
 
-## Inspect proxy logs
+Inject a consumable fault (first 2 `Now` calls fail, then recover):
 
 ```sh
-find logs/morpheus-proxy -type f | sort
+curl -s "$A/rules" -H 'content-type: application/json' -d '{
+  "id":"now-fault-2x","protocol":"grpc","priority":100,
+  "match":{"type":"regex","field":"path","pattern":"^/demo\\.TimeService/Now$"},
+  "request":{"action":{"type":"fault","fault":{"kind":"grpc_status","status":14,"message":"injected"}}},
+  "consume":{"times":2}
+}' >/dev/null
+
+curl -s 'http://localhost:18080/echo?message=t1'   # ms-a fails to get the time (2x)
+curl -s 'http://localhost:18080/echo?message=t2'
+curl -s 'http://localhost:18080/echo?message=t3'   # recovered
 ```
 
-Each proxied connection writes:
+gRPC message bodies (mock, body matchers, decoded body logging) require a
+descriptor — register `demo.proto` at `POST $A/grpc/descriptors`. See spec 4.7.
 
-- `*.request.bin`: bytes sent toward the upstream service
-- `*.response.bin`: bytes sent back to the caller
-- `*.meta.json`: connection metadata
+## Web UI
+
+```sh
+open http://localhost:18081/_morpheus/
+```
+
+Dashboard (listeners, request counts), Rules, Logs (realtime), Descriptors,
+Settings.
 
 ## Stop
 
@@ -136,5 +121,6 @@ Each proxied connection writes:
 docker compose down
 ```
 
-The default host ports are `18080` for HTTP and `15051` for gRPC. Override them
-with `MS_A_HTTP_PORT` and `MS_A_GRPC_PORT` if needed.
+Host ports default to `18080` (ms-a HTTP), `50051` (ms-a gRPC), `18081`
+(morpheus admin/UI); override with `MS_A_HTTP_PORT`, `MS_A_GRPC_PORT`,
+`MORPHEUS_PROXY_STATUS_PORT`.

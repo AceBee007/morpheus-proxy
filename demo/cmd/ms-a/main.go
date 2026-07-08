@@ -123,12 +123,12 @@ func main() {
 		log.Fatalf("configure time grpc client for %s: %v", timeAddr, err)
 	}
 
-	animalSoundDialOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-	if animalSoundAddr == timeAddr {
-		animalSoundDialOptions, err = grpcDialOptions(animalSoundAddr, "")
-		if err != nil {
-			log.Fatalf("configure animal sound grpc client for %s: %v", animalSoundAddr, err)
-		}
+	// Route the animal-sound downstream through the same proxy (if any) as the
+	// time downstream, so both ms-a -> ms-b calls are intercepted when
+	// GRPC_PROXY_ADDR is set (docs/spec.md 4.14).
+	animalSoundDialOptions, err := grpcDialOptions(animalSoundAddr, grpcProxyAddr)
+	if err != nil {
+		log.Fatalf("configure animal sound grpc client for %s: %v", animalSoundAddr, err)
 	}
 
 	timeConn, err := grpc.NewClient(timeAddr, timeDialOptions...)

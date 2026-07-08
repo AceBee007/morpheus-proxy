@@ -15,6 +15,7 @@ import { AppLogger } from './logging/app-log.js';
 import { MaskRegistry } from './logging/mask.js';
 import { TrafficLogStore } from './logging/traffic-log.js';
 import { MetricsRegistry } from './observability/metrics.js';
+import { startConnectListener } from './proxy/connect-listener.js';
 import { startHttpListener, type StartedListener } from './proxy/http-listener.js';
 import { startRetentionLoop } from './retention.js';
 import { ConsumeRegistry } from './rules/consume.js';
@@ -112,7 +113,9 @@ async function main(): Promise<void> {
       scriptRunner,
       manipulatorRunner,
     };
-    if (listenerConfig.protocol === 'http') {
+    if (listenerConfig.mode === 'connect') {
+      listeners.push(await startConnectListener({ ...runtime, descriptors }));
+    } else if (listenerConfig.protocol === 'http') {
       listeners.push(await startHttpListener(runtime));
     } else {
       listeners.push(await startGrpcListener({ ...runtime, descriptors }));

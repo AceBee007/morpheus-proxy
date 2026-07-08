@@ -5,7 +5,7 @@ import { fromNodeHeaders, toOutgoingHeaders } from './headers.js';
 import { parseUpstream } from './upstream.js';
 import { handleHttpExchange, type HttpExchange, type ProxyRuntime } from './pipeline.js';
 
-const H2_PREFACE = Buffer.from('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n', 'ascii');
+export const H2_PREFACE = Buffer.from('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n', 'ascii');
 
 export interface StartedListener {
   name: string;
@@ -19,7 +19,7 @@ function clientOf(socket: net.Socket): string {
   return `${socket.remoteAddress ?? 'unknown'}:${socket.remotePort ?? 0}`;
 }
 
-function h1Exchange(req: http.IncomingMessage, res: http.ServerResponse): HttpExchange {
+export function h1Exchange(req: http.IncomingMessage, res: http.ServerResponse): HttpExchange {
   res.sendDate = false;
   let responded = false;
   return {
@@ -68,7 +68,7 @@ function h1Exchange(req: http.IncomingMessage, res: http.ServerResponse): HttpEx
   };
 }
 
-function h2Exchange(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders): HttpExchange {
+export function h2Exchange(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders): HttpExchange {
   let responded = false;
   return {
     method: String(headers[':method'] ?? 'GET'),

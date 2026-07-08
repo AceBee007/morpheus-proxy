@@ -1018,22 +1018,16 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
   void headerStageMatched;
 }
 
-/** Starts the gRPC (HTTP/2 cleartext) proxy listener (spec 3.5, 4.7). */
-export function startGrpcListener(runtime: GrpcRuntime): Promise<StartedListener> {
-  const { listener, limits, appLog } = runtime;
-  const sessions = new Set<http2.ServerHttp2Session>();
-
-  const server = http2.createServer();
-  server.on('session', (session) => {
-    if (sessions.size >= limits.maxConcurrentConnections) {
-      session.destroy();
-      return;
-    }
-    sessions.add(session);
-    session.on('close', () => sessions.delete(session));
-    session.on('error', () => sessions.delete(session));
-  });
-  server.on('stream', (stream, headers) => {
+/**
+ * Builds the HTTP/2 `stream` handler for a gRPC runtime. Shared by the reverse
+ * gRPC listener and the CONNECT listener (which binds a per-connection runtime
+ * whose upstream is the CONNECT authority, spec 4.14).
+ */
+export function grpcStreamHandler(
+  runtime: GrpcRuntime,
+): (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => void {
+  const { appLog } = runtime;
+  return (stream, headers) => {
     const ctx: StreamContext = {
       stream,
       path: String(headers[':path'] ?? '/'),
@@ -1057,7 +1051,25 @@ export function startGrpcListener(runtime: GrpcRuntime): Promise<StartedListener
         stream.destroy();
       }
     });
+  };
+}
+
+/** Starts the gRPC (HTTP/2 cleartext) proxy listener (spec 3.5, 4.7). */
+export function startGrpcListener(runtime: GrpcRuntime): Promise<StartedListener> {
+  const { listener, limits, appLog } = runtime;
+  const sessions = new Set<http2.ServerHttp2Session>();
+
+  const server = http2.createServer();
+  server.on('session', (session) => {
+    if (sessions.size >= limits.maxConcurrentConnections) {
+      session.destroy();
+      return;
+    }
+    sessions.add(session);
+    session.on('close', () => sessions.delete(session));
+    session.on('error', () => sessions.delete(session));
   });
+  server.on('stream', grpcStreamHandler(runtime));
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);

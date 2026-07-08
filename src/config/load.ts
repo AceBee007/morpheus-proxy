@@ -140,12 +140,34 @@ function mergeListener(
     );
     return null;
   }
+  const rawMode = raw['mode'];
+  let mode: 'connect' | undefined;
+  if (rawMode === undefined || rawMode === 'reverse') {
+    mode = undefined; // reverse is the implicit default
+  } else if (rawMode === 'connect') {
+    mode = 'connect';
+  } else {
+    warnings.push(
+      `config: ${path}mode must be "reverse" or "connect" (got ${JSON.stringify(rawMode)}); using "reverse"`,
+    );
+    mode = undefined;
+  }
   const upstream = raw['upstream'];
-  if (typeof upstream !== 'string' || !UPSTREAM_PATTERN.test(upstream)) {
+  let upstreamValue: string;
+  if (mode === 'connect') {
+    // connect listeners derive the upstream from the CONNECT authority; a fixed
+    // upstream is not applicable (spec 4.14).
+    if (upstream !== undefined) {
+      warnings.push(`config: ${path}upstream is ignored for connect-mode listeners`);
+    }
+    upstreamValue = '';
+  } else if (typeof upstream !== 'string' || !UPSTREAM_PATTERN.test(upstream)) {
     warnings.push(
       `config: ${path}upstream must be an http:// or h2c:// URL (got ${JSON.stringify(upstream)}); listener skipped`,
     );
     return null;
+  } else {
+    upstreamValue = upstream;
   }
   const base = protocol === 'http' ? defaultHttpListener() : defaultGrpcListener();
   const reader = new SectionReader(raw, path, warnings);
@@ -156,7 +178,8 @@ function mergeListener(
     protocol,
     host: reader.string('host', base.host),
     port: reader.positiveInt('port', defaultPort),
-    upstream,
+    ...(mode === 'connect' ? { mode } : {}),
+    upstream: upstreamValue,
     decodeBody: reader.boolean('decodeBody', base.decodeBody),
     descriptors: reader.stringArray('descriptors', base.descriptors),
     maxRequestBodyBufferBytes: reader.positiveInt(
@@ -173,6 +196,7 @@ function mergeListener(
     'protocol',
     'host',
     'port',
+    'mode',
     'upstream',
     'decodeBody',
     'descriptors',

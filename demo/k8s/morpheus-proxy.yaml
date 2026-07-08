@@ -1,6 +1,7 @@
-# morpheus-proxy deployed inside the mesh, proxying to the real ms-a over
-# HTTP and gRPC. Exercises the new HTTP/gRPC reverse-proxy implementation
-# against live cluster traffic (docs/spec.md).
+# LEGACY REFERENCE — standalone reverse-proxy deployment (not a sidecar).
+# Kept as the first-milestone smoke-test manifest: a separate morpheus
+# Deployment proxying to the real ms-a over HTTP and gRPC. For the primary
+# deployment model (CONNECT egress sidecar) see ms-a-morpheus-connect.yaml.
 apiVersion: v1
 kind: ConfigMap
 metadata:

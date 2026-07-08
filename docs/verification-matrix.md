@@ -2,7 +2,7 @@
 
 docs/spec.md の各要件について「実装 → unit test → 実機/UI 検証」の対応を示す。
 
-- **Unit**: 該当機能を検証する vitest テスト(合計 232 件 / 18 ファイル、`npm test`)
+- **Unit**: 該当機能を検証する vitest テスト(合計 236 件 / 19 ファイル、`npm test`)
 - **GKE**: GCP `GCP_PROJECT_ID_REDACTED`(ms-a 両方向サイドカー)での実 traffic 検証
 - **UI**: playwright-mcp による実デプロイの UI 操作検証
 
@@ -47,6 +47,7 @@ docs/spec.md の各要件について「実装 → unit test → 実機/UI 検�
 | 4.11 Safety and limits | `config/*`, `pipeline.ts` | `load.test.ts` | GKE: config 経由の limits/listener |
 | 4.12 Observability / metrics | `observability/metrics.ts`, `server.ts` | `admin-api.integration.test.ts`(JSON + Prometheus) | GKE: /api/v1/metrics(JSON)、/_morpheus/metrics(Prometheus) |
 | 4.13 Configuration(default fallback) | `config/load.ts`, `defaults.ts` | `load.test.ts`, `defaults.test.ts` | GKE: ConfigMap の JSONC で起動 |
+| 4.14 CONNECT egress listener | `proxy/connect-listener.ts`, `config/load.ts` | `connect.integration.test.ts`(HTTP/1.1 透過+mock、gRPC via `grpc_proxy` の consume fault) | GKE(istio クラスタ、ms-a 3/3 = app + istio-proxy + morpheus): `GRPC_PROXY_ADDR` のみ追加(`MS_B_ADDR`/Service targetPort 据置)→ Now + Sound の複数下流呼び出しを 1 listener で capture、consume fault 502×2→回復、envoy `outbound\|50052\|\|ms-b` の rq_total 増分で morpheus→ms-b が istio-proxy 経由と確認 |
 | §5 Web UI | `ui/` (React SPA) | UI は playwright で検証(ロジックは backend unit) | UI: Dashboard/Rules/Editor(3 mode)/Logs(SSE)/Descriptors/Settings 全画面 |
 
 ## UI 画面別 playwright 検証(GKE 実デプロイ)

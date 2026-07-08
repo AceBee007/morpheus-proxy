@@ -5,7 +5,19 @@ export interface ListenerConfig {
   protocol: ListenerProtocol;
   host: string;
   port: number;
-  /** Upstream URL. `http://` for HTTP/1.1 upstreams, `h2c://` for HTTP/2 cleartext. */
+  /**
+   * How the listener obtains its upstream target (spec 3.2).
+   * - `reverse` (default, omitted): forward to the fixed `upstream` below.
+   * - `connect`: accept an HTTP CONNECT tunnel and use the CONNECT authority
+   *   as the per-connection upstream. Lets one listener intercept a client's
+   *   outbound calls to many downstreams via a single client proxy setting
+   *   (e.g. `GRPC_PROXY_ADDR` / `HTTPS_PROXY`); `upstream` is ignored (spec 4.14).
+   */
+  mode?: 'reverse' | 'connect';
+  /**
+   * Upstream URL for reverse mode. `http://` for HTTP/1.1, `h2c://` for HTTP/2
+   * cleartext. Empty string for connect mode (upstream is the CONNECT authority).
+   */
   upstream: string;
   decodeBody: boolean;
   /** Paths to protobuf descriptor set files, gRPC listeners only. */

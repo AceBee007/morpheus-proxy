@@ -1,19 +1,18 @@
-# SECONDARY REFERENCE — reverse mode (docs/spec.md 3.2 副方式).
-# The primary deployment is the CONNECT egress sidecar: see
-# ms-a-morpheus-connect.yaml (no address rewrites, one listener for all
-# downstreams). Use this reverse variant only when the client cannot take a
-# proxy setting, or when inbound interception is explicitly needed.
+# ms-a with morpheus-proxy as a CONNECT egress sidecar (docs/spec.md 4.14).
 #
-# ms-a with morpheus-proxy as a bidirectional reverse sidecar:
+#   ms-a app --(GRPC_PROXY_ADDR)--> morpheus :15052 (CONNECT) --> ms-b:50052
+#                                        └── inspects/manipulates ms-a -> ms-b
 #
-#   inbound:  peer → ms-a istio-proxy → morpheus :18080/:15051 → ms-a app 127.0.0.1:8080/:50051
-#   outbound: ms-a app → morpheus :15052 → (istio-proxy mTLS) → ms-b:50052
+# Unlike ms-a-morpheus-sidecar.yaml (reverse, one outbound listener per
+# downstream + a rewritten MS_B_ADDR), here the app keeps every downstream
+# address unchanged and only gains a single GRPC_PROXY_ADDR. morpheus accepts an
+# HTTP CONNECT tunnel, uses the CONNECT authority (ms-b:50052, ms-c:..., ...) as
+# the per-connection upstream, runs the rule pipeline on the plaintext h2c, then
+# forwards to the real downstream (Istio mTLS-wraps morpheus -> downstream).
 #
-# Inbound: the Service targetPort points at morpheus, so peer traffic to ms-a is
-# proxied, then forwarded to the app over loopback (not istio-captured).
-# Outbound: ms-a's downstream address (MS_B_ADDR) points at the morpheus outbound
-# listener on loopback; morpheus forwards to ms-b, which leaves the pod and is
-# mTLS-wrapped by istio. This lets morpheus intercept ms-a → ms-b calls.
+# The Service targetPort is NOT changed: peer -> ms-a traffic reaches the app
+# directly. Only ms-a's OUTBOUND gRPC calls are intercepted, which is the
+# "ms-a -> morpheus -> istio -> ms-b" goal.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -25,25 +24,11 @@ data:
       "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
         {
-          "name": "http-in",
-          "protocol": "http",
-          "host": "0.0.0.0",
-          "port": 18080,
-          "upstream": "http://127.0.0.1:8080"
-        },
-        {
-          "name": "grpc-in",
-          "protocol": "grpc",
-          "host": "0.0.0.0",
-          "port": 15051,
-          "upstream": "h2c://127.0.0.1:50051"
-        },
-        {
-          "name": "grpc-out-msb",
+          "name": "grpc-egress",
           "protocol": "grpc",
           "host": "127.0.0.1",
           "port": 15052,
-          "upstream": "h2c://ms-b:50052"
+          "mode": "connect"
         }
       ],
       "logging": {
@@ -84,7 +69,7 @@ spec:
         version: main
     spec:
       containers:
-        # --- application (unchanged; morpheus reaches it over loopback) ---
+        # --- application: downstream addresses UNCHANGED; only GRPC_PROXY_ADDR is added ---
         - name: ms-a
           image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/ms-a:latest
           imagePullPolicy: Always
@@ -93,10 +78,13 @@ spec:
               value: ":8080"
             - name: GRPC_ADDR
               value: ":50051"
-            # downstream calls go through the morpheus outbound listener (loopback)
+            # downstream addresses stay pointed at the real services
             - name: MS_B_ADDR
-              value: "127.0.0.1:15052"
+              value: "ms-b:50052"
             - name: MS_B_ANIMAL_SOUND_ADDR
+              value: "ms-b:50052"
+            # the only change: send gRPC dials through the morpheus CONNECT proxy
+            - name: GRPC_PROXY_ADDR
               value: "127.0.0.1:15052"
           ports:
             - name: http
@@ -117,7 +105,7 @@ spec:
             requests:
               cpu: 250m
               memory: 512Mi
-        # --- morpheus-proxy sidecar (serves both inbound and outbound listeners) ---
+        # --- morpheus-proxy sidecar (CONNECT egress listener only) ---
         - name: morpheus-proxy
           image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/morpheus-proxy:latest
           imagePullPolicy: Always
@@ -125,13 +113,9 @@ spec:
             - name: MORPHEUS_CONFIG
               value: /etc/morpheus/morpheus.jsonc
           ports:
-            - name: mp-http
-              containerPort: 18080
             - name: mp-admin
               containerPort: 18081
-            - name: mp-grpc
-              containerPort: 15051
-            # outbound listener is bound to loopback only (not a Service port)
+            # the CONNECT listener (15052) is loopback-only, not a Service port
           readinessProbe:
             httpGet:
               path: /_morpheus/healthz/ready
@@ -174,13 +158,13 @@ spec:
   selector:
     app.kubernetes.io/name: ms-a
   ports:
-    # inbound traffic now lands on morpheus, which forwards to the ms-a app
+    # inbound is unchanged: peer traffic reaches the ms-a app directly
     - name: http
       port: 8080
-      targetPort: 18080
+      targetPort: 8080
     - name: grpc
       port: 50051
-      targetPort: 15051
+      targetPort: 50051
     # optional: reach the morpheus admin API / UI in-cluster
     - name: mp-admin
       port: 18081

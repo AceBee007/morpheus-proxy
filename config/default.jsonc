@@ -11,6 +11,15 @@
     // Change this prefix if it would collide with paths of the real service.
     "basePath": "/_morpheus"
   },
+  // Each listener has a protocol (http/grpc) and an optional ingress "mode":
+  //   "reverse" (default): forward to the fixed "upstream" below.
+  //   "connect": accept an HTTP CONNECT tunnel and use the CONNECT authority as
+  //     the per-connection upstream, so one listener can intercept a client's
+  //     outbound calls to many downstreams via a single client proxy setting
+  //     (e.g. GRPC_PROXY_ADDR / HTTPS_PROXY); "upstream" is then ignored. See
+  //     docs/spec.md 4.14. Example:
+  //       { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1",
+  //         "port": 15052, "mode": "connect" }
   "listeners": [
     {
       "name": "http",

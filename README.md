@@ -11,12 +11,19 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 - **Runtime**: Node.js 24 LTS + TypeScript, ESM (`moduleResolution: NodeNext`)
 - **Data plane**: HTTP/1.1, HTTP/2 (h2c), gRPC unary + streaming
 - **Control plane**: JSON admin API + React SPA on a dedicated admin port
-- **Deployment model**: sits between a microservice and its istio sidecar;
-  TLS/mTLS is terminated by istio, so morpheus only handles plaintext
+- **Deployment model**: a sidecar next to the app, coexisting with the istio
+  sidecar; TLS/mTLS stays with istio, morpheus only handles plaintext.
+  The primary mode is a **CONNECT egress listener** (spec 4.14): the app keeps
+  its downstream addresses unchanged and only gains a client proxy setting
+  (e.g. `GRPC_PROXY_ADDR`); one listener intercepts the app's outbound calls
+  to any number of downstreams. Reverse listeners (fixed upstream, incl.
+  inbound) remain available as a secondary option (spec 3.2)
 - **Default behaviour**: transparent forwarding; rules apply only on a match
 
 ## Capabilities
 
+- CONNECT egress interception: one `mode: "connect"` listener proxies the
+  app's outbound calls to many downstreams without address rewrites
 - Regex / composite (`all` / `any` / `not`) / script matchers
 - Request stage: `mock_response`, `fault`, `request_rewrite`, delay
 - Response stage: `fault`, `response_replace` (header regex), `script_manipulator`, delay
@@ -66,6 +73,14 @@ Endpoints (default base path `/_morpheus`, admin port `18081`):
 
 ## Kubernetes / demo
 
-[demo/k8s/morpheus-proxy.yaml](demo/k8s/morpheus-proxy.yaml) deploys morpheus
-into a mesh, proxying to a live `ms-a` over HTTP and gRPC. The multi-stage
-[Dockerfile](Dockerfile) builds both the proxy and the UI.
+- [demo/k8s/ms-a-morpheus-connect.yaml](demo/k8s/ms-a-morpheus-connect.yaml) —
+  **primary demo**: morpheus as a CONNECT egress sidecar intercepting
+  `ms-a → ms-b` gRPC in an istio mesh (verified on GKE + Istio)
+- [demo/README.md](demo/README.md) — local docker compose version of the same
+  CONNECT topology
+- [demo/k8s/ms-a-morpheus-sidecar.yaml](demo/k8s/ms-a-morpheus-sidecar.yaml) —
+  secondary reference: reverse mode (inbound + per-downstream outbound)
+- [docs/how-to-setup.md](docs/how-to-setup.md) — step-by-step guide for adding
+  morpheus to an existing dev service
+
+The multi-stage [Dockerfile](Dockerfile) builds both the proxy and the UI.
