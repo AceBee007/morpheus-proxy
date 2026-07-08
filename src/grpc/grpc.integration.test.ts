@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { nullLogger } from '../logging/app-log.js';
+import { ScriptSandbox } from '../script/sandbox.js';
 import { startTestProxy, type TestProxy } from '../testing/harness.js';
 import { DescriptorRegistry } from './descriptors.js';
 
@@ -117,14 +119,20 @@ function registryWithProto(): DescriptorRegistry {
 
 async function setupGrpcProxy(
   rules: unknown[] = [],
-  opts: { withDescriptor?: boolean } = {},
+  opts: { withDescriptor?: boolean; withSandbox?: boolean } = {},
 ): Promise<{ proxy: TestProxy; client: InstanceType<ServiceClientCtor> }> {
   const descriptors = opts.withDescriptor === false ? new DescriptorRegistry() : registryWithProto();
+  let sandbox: ScriptSandbox | undefined;
+  if (opts.withSandbox) {
+    sandbox = new ScriptSandbox({ defaultTimeoutMs: 3_000, maxTimeoutMs: 60_000, appLog: nullLogger() });
+    cleanups.push(() => sandbox!.close());
+  }
   const proxy = await startTestProxy({
     upstream: `h2c://127.0.0.1:${upstreamPort}`,
     protocol: 'grpc',
     descriptors,
     rules,
+    ...(sandbox ? { scriptRunner: sandbox.matcherRunner(), manipulatorRunner: sandbox.manipulatorRunner() } : {}),
   });
   cleanups.push(() => proxy.close());
   const Ctor = serviceCtor();
@@ -365,6 +373,101 @@ describe('gRPC unary proxying (spec 4.7)', () => {
     const entry = proxy.trafficLog.list().items[0];
     expect(entry?.request.bodyLogged).toBe(false);
     expect(entry?.response.bodyLogged).toBe(false);
+  });
+});
+
+describe('gRPC script matcher / manipulator (spec 4.4.3, 4.5.6)', () => {
+  it('matches with a script and rewrites the message body via a script manipulator', async () => {
+    const { proxy, client } = await setupGrpcProxy(
+      [
+        {
+          id: 'grpc-script',
+          protocol: 'grpc',
+          match: {
+            type: 'script',
+            language: 'javascript',
+            // gRPC metadata is exposed both as ctx.request.headers and ctx.request.grpc.metadata
+            source: "return ctx.request.grpc.method === 'Now' && ctx.request.grpc.metadata['x-scripted'] === 'yes';",
+          },
+          response: {
+            action: {
+              type: 'script_manipulator',
+              language: 'javascript',
+              // ctx.response.grpc.messages is the decoded upstream message array
+              source:
+                "const m = ctx.response.grpc.messages[0]; return { messages: [{ iso: m.iso, source: 'scripted-' + m.source }] };",
+            },
+          },
+        },
+      ],
+      { withSandbox: true },
+    );
+
+    // no header -> script matcher returns false -> passthrough
+    const plain = await callNow(client, 'utc');
+    expect(plain.response?.source).toBe('real');
+
+    const md = new grpc.Metadata();
+    md.set('x-scripted', 'yes');
+    const scripted = await callNow(client, 'utc', md);
+    expect(scripted.error).toBeUndefined();
+    expect(scripted.response?.source).toBe('scripted-real'); // manipulator re-encoded the message
+    expect(scripted.response?.iso).toBe('2026-06-10T00:00:00.000Z');
+
+    const entry = proxy.trafficLog.list({ ruleId: 'grpc-script' }).items[0];
+    expect(entry?.outcome).toBe('modified');
+    expect(entry?.upstreamResponse?.bodyPreview).toContain('"source":"real"');
+    expect(entry?.response.bodyPreview).toContain('scripted-real');
+  });
+
+  it('edits grpcStatus / trailers via a script manipulator', async () => {
+    const { client } = await setupGrpcProxy(
+      [
+        {
+          id: 'grpc-script-status',
+          protocol: 'grpc',
+          match: { type: 'regex', field: 'grpc.method', pattern: '^Now$' },
+          response: {
+            action: {
+              type: 'script_manipulator',
+              language: 'javascript',
+              source: "return { grpcStatus: 7, grpcMessage: 'denied by script', trailers: { 'x-by': 'script' } };",
+            },
+          },
+        },
+      ],
+      { withSandbox: true },
+    );
+    const { error } = await callNow(client);
+    expect(error?.code).toBe(grpc.status.PERMISSION_DENIED);
+    expect(error?.details).toBe('denied by script');
+    expect(error?.metadata.get('x-by')).toEqual(['script']);
+  });
+
+  it('script manipulator error falls back to passthrough with rule_error', async () => {
+    const { proxy, client } = await setupGrpcProxy(
+      [
+        {
+          id: 'grpc-script-boom',
+          protocol: 'grpc',
+          match: { type: 'regex', field: 'grpc.method', pattern: '^Now$' },
+          response: {
+            action: {
+              type: 'script_manipulator',
+              language: 'javascript',
+              source: "throw new Error('boom in script');",
+            },
+          },
+        },
+      ],
+      { withSandbox: true },
+    );
+    const { response, error } = await callNow(client);
+    expect(error).toBeUndefined(); // upstream response passed through
+    expect(response?.source).toBe('real');
+    const entry = proxy.trafficLog.list().items[0];
+    expect(entry?.outcome).toBe('rule_error');
+    expect(entry?.ruleErrors?.[0]?.error).toContain('boom in script');
   });
 });
 

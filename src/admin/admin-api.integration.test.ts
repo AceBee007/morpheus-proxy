@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { nullLogger } from '../logging/app-log.js';
+import { ScriptSandbox } from '../script/sandbox.js';
 import {
   startTestStack,
   startTestUpstream,
@@ -424,6 +426,55 @@ describe('simulation (spec 4.2.6)', () => {
     };
     expect(body.results[0]?.outcome).toBe('modified');
     expect(body.results[0]?.responseStage.headersAfter['x-data-source']).toBe('mock-db');
+  });
+
+  it('simulates a script_manipulator draft against a sample response (spec 4.2.6)', async () => {
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const sandbox = new ScriptSandbox({ defaultTimeoutMs: 3_000, maxTimeoutMs: 60_000, appLog: nullLogger() });
+    cleanups.push(() => sandbox.close());
+    const stack = await startTestStack({
+      upstream: upstream.url,
+      scriptRunner: sandbox.matcherRunner(),
+      manipulatorRunner: sandbox.manipulatorRunner(),
+    });
+    cleanups.push(() => stack.close());
+
+    const res = await stack.api(
+      '/api/v1/rules:simulate',
+      json({
+        sampleRequest: { protocol: 'http', method: 'GET', path: '/users/1' },
+        sampleResponse: { statusCode: 200, headers: {}, body: '{"source":"real"}' },
+        ruleDraft: {
+          id: 'script-draft',
+          protocol: 'http',
+          match: { type: 'script', language: 'javascript', source: "return ctx.request.path.startsWith('/users');" },
+          response: {
+            action: {
+              type: 'script_manipulator',
+              language: 'javascript',
+              source: "return { statusCode: 299, body: ctx.response.body.replace('real', 'mock') };",
+            },
+          },
+        },
+        options: { includeBodyDiff: true },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      results: Array<{
+        interceptRule: string | null;
+        outcome: string;
+        responseStage: { action: string; changed: boolean; statusAfter: number; bodyAfter?: string };
+      }>;
+    };
+    const r = body.results[0];
+    expect(r?.interceptRule).toBe('script-draft'); // script matcher matched in the sandbox
+    expect(r?.outcome).toBe('modified');
+    expect(r?.responseStage.action).toBe('script_manipulator');
+    expect(r?.responseStage.changed).toBe(true);
+    expect(r?.responseStage.statusAfter).toBe(299);
+    expect(r?.responseStage.bodyAfter).toBe('{"source":"mock"}');
   });
 
   it('reports skipped body simulation when the body was not logged', async () => {

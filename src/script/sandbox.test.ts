@@ -63,6 +63,63 @@ describe('ScriptSandbox (spec 4.4.3)', () => {
     expect(patch).toEqual({ body: 'mock-value', headers: { 'x-edited': 'yes' } });
   });
 
+  it('coerces non-boolean matcher return values to booleans', async () => {
+    const sandbox = makeSandbox();
+    const runner = sandbox.matcherRunner();
+    const base = {
+      protocol: 'http' as const,
+      stage: 'request' as const,
+      request: { id: 'r', path: '/', headers: {} },
+      ruleState: { hits: 0 },
+    };
+    const m = (source: string) => ({ type: 'script' as const, language: 'javascript' as const, source });
+    expect(await runner(m('return "truthy string";'), base)).toBe(true);
+    expect(await runner(m('return 0;'), base)).toBe(false);
+    expect(await runner(m('return null;'), base)).toBe(false);
+    expect(await runner(m('return undefined;'), base)).toBe(false);
+    expect(await runner(m('return {};'), base)).toBe(true);
+  });
+
+  it('treats null/undefined manipulator returns as an empty patch', async () => {
+    const sandbox = makeSandbox();
+    const runner = sandbox.manipulatorRunner();
+    const ctx = {
+      protocol: 'http' as const,
+      stage: 'response' as const,
+      request: { id: 'r', path: '/', headers: {} },
+      response: { statusCode: 200, headers: {} },
+      ruleState: { hits: 0 },
+      upstream: { durationMs: 1 },
+    };
+    const action = (source: string) => ({
+      type: 'script_manipulator' as const,
+      language: 'javascript' as const,
+      source,
+    });
+    expect(await runner(action('return null;'), ctx)).toEqual({});
+    expect(await runner(action('/* no return */'), ctx)).toEqual({});
+  });
+
+  it('rejects manipulator returns that are not a plain object', async () => {
+    const sandbox = makeSandbox();
+    const runner = sandbox.manipulatorRunner();
+    const ctx = {
+      protocol: 'http' as const,
+      stage: 'response' as const,
+      request: { id: 'r', path: '/', headers: {} },
+      response: { statusCode: 200, headers: {} },
+      ruleState: { hits: 0 },
+      upstream: { durationMs: 1 },
+    };
+    const action = (source: string) => ({
+      type: 'script_manipulator' as const,
+      language: 'javascript' as const,
+      source,
+    });
+    await expect(runner(action('return [1,2,3];'), ctx)).rejects.toThrow(/response patch object/);
+    await expect(runner(action('return "nope";'), ctx)).rejects.toThrow(/response patch object/);
+  });
+
   it('rejects on compile errors', async () => {
     const sandbox = makeSandbox();
     await expect(sandbox.run('this is not javascript ~~~', {})).rejects.toThrow(/compile error/);

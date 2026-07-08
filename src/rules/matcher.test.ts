@@ -112,6 +112,57 @@ describe('evalMatcher', () => {
     const m: Matcher = { type: 'script', language: 'javascript', source: 'return true;' };
     await expect(evalMatcher(m, httpInput())).rejects.toThrow(/script matcher/);
   });
+
+  it('passes the runner to scripts nested inside composite matchers (complex matcher)', async () => {
+    const seen: string[] = [];
+    const runner = async (matcher: { source: string }): Promise<boolean> => {
+      seen.push(matcher.source);
+      return matcher.source.includes('yes');
+    };
+    // script deep inside all(any(not(script)))
+    const nested: Matcher = {
+      type: 'all',
+      conditions: [
+        regex('path', '^/users'),
+        {
+          type: 'any',
+          conditions: [
+            { type: 'script', language: 'javascript', source: 'return no' },
+            { type: 'not', condition: { type: 'script', language: 'javascript', source: 'return yes-inverted' } },
+          ],
+        },
+      ],
+    };
+    // any() short-circuits: first script 'no' -> false, then not(script 'yes') -> not(true) -> false => any false => all false
+    expect(await evalMatcher(nested, httpInput(), runner)).toBe(false);
+    expect(seen).toEqual(['return no', 'return yes-inverted']);
+  });
+
+  it('short-circuits all() before reaching a nested script when an earlier condition fails', async () => {
+    let called = false;
+    const runner = async (): Promise<boolean> => {
+      called = true;
+      return true;
+    };
+    const m: Matcher = {
+      type: 'all',
+      conditions: [
+        regex('path', '^/nope'), // fails first
+        { type: 'script', language: 'javascript', source: 'return true' },
+      ],
+    };
+    expect(await evalMatcher(m, httpInput(), runner)).toBe(false);
+    expect(called).toBe(false); // script never runs
+  });
+
+  it('not() inverts a nested script result', async () => {
+    const runner = async (): Promise<boolean> => true;
+    const m: Matcher = {
+      type: 'not',
+      condition: { type: 'script', language: 'javascript', source: 'return true' },
+    };
+    expect(await evalMatcher(m, httpInput(), runner)).toBe(false);
+  });
 });
 
 describe('matcherUsesBody', () => {
