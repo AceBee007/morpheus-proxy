@@ -214,14 +214,21 @@ export function mergeWithDefaults(raw: Raw, warnings: string[]): MorpheusConfig 
         const listener = mergeListener(entry, index, warnings);
         if (listener) merged.push(listener);
       });
-      const seenProtocols = new Set<string>();
+      // Multiple listeners (inbound/outbound, per protocol, per downstream) are
+      // valid; only name/port collisions are misconfigurations (spec 3.2).
+      const seenNames = new Set<string>();
+      const seenPorts = new Set<number>();
       for (const listener of merged) {
-        if (seenProtocols.has(listener.protocol)) {
+        if (seenNames.has(listener.name)) {
+          warnings.push(`config: duplicate listener name "${listener.name}"`);
+        }
+        seenNames.add(listener.name);
+        if (seenPorts.has(listener.port)) {
           warnings.push(
-            `config: multiple listeners with protocol "${listener.protocol}" configured; this is unsupported (spec 3.2)`,
+            `config: multiple listeners share port ${listener.port}; each listener needs a unique port`,
           );
         }
-        seenProtocols.add(listener.protocol);
+        seenPorts.add(listener.port);
       }
       config.listeners = merged;
     } else {

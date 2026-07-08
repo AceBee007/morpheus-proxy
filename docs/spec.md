@@ -59,10 +59,22 @@ inbound:  peer service → istio-proxy (mTLS 終端) → morpheus-proxy → ms
 outbound: ms → morpheus-proxy → istio-proxy (mTLS) → peer service
 ```
 
+morpheus-proxy は inbound / outbound のどちらか、または両方を挟める。方向は listener の
+upstream の向き先で決まるだけで、Core は方向の区別を持たない。
+
+- inbound: 呼ばれる側の Service `targetPort` を morpheus に向け、morpheus の upstream を
+  同一 pod の app(`http://127.0.0.1:<appPort>` / `h2c://127.0.0.1:<appPort>`)にする。
+  peer からの request / それに対する app の response を挟む。
+- outbound: app が下流サービスを呼ぶ宛先を morpheus(`127.0.0.1:<outPort>`)に向け、
+  morpheus の upstream を実際の下流サービス(`h2c://<downstream>:<port>` 等)にする。
+  app が出す request / 下流からの response を挟む。morpheus → 下流は pod を出るため
+  istio-proxy が mTLS 化する。
+
 - TLS / mTLS の終端と暗号化は istio-proxy が行う。morpheus-proxy に到達する traffic は plaintext(HTTP/1.1 または h2c)である
 - morpheus-proxy は ms と同一 pod 内(または同一ホスト上)で reverse proxy として動作する
-- listener と upstream は 1:1 で対応する。host / path ベースの複数宛先 routing は行わない
-- 同じ protocol の listener を複数構成することは想定しない(protocol ごとに listener は 1 つ)
+- listener と upstream は 1:1 で対応する。1 つの listener は 1 つの upstream に固定で転送し、host / path ベースの複数宛先 routing は行わない
+- listener は複数構成できる(inbound / outbound、protocol ごと、下流サービスごと)。listener の `name` と `port` は一意でなければならない。同じ protocol の listener を別ポートで複数持つのは正当な構成(例: inbound gRPC と outbound gRPC)
+- 1 つの app が複数の下流サービスを呼ぶ outbound を挟む場合は、下流ごとに listener を 1 つ立て、app 側の各宛先をそれぞれの morpheus listener に向ける
 
 注意: ms 自身が mesh を経由せず直接 TLS で外部と通信する traffic(例: 外部 SaaS への HTTPS)は istio でも morpheus でも復号できないため、inspect 対象外である。
 

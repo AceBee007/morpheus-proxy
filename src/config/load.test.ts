@@ -147,19 +147,48 @@ describe('loadConfig', () => {
     expect(result.warnings.some((w) => w.includes('port'))).toBe(true);
   });
 
-  it('warns about duplicate listener protocols', () => {
+  it('allows multiple listeners of the same protocol on different ports (inbound + outbound)', () => {
     writeConfig(
       'morpheus.jsonc',
       `{
         "listeners": [
-          { "protocol": "http", "port": 1001, "upstream": "http://127.0.0.1:1" },
-          { "protocol": "http", "port": 1002, "upstream": "http://127.0.0.1:2" }
+          { "name": "grpc-in", "protocol": "grpc", "port": 15051, "upstream": "h2c://127.0.0.1:50051" },
+          { "name": "grpc-out", "protocol": "grpc", "port": 15052, "upstream": "h2c://ms-b:50052" }
         ]
       }`,
     );
     const result = loadConfig({ cwd: dir });
     expect(result.config.listeners).toHaveLength(2);
-    expect(result.warnings.some((w) => w.includes('multiple listeners'))).toBe(true);
+    // same protocol on distinct ports is a valid bidirectional config: no warning
+    expect(result.warnings.some((w) => w.includes('port') || w.includes('duplicate'))).toBe(false);
+  });
+
+  it('warns when two listeners share a port', () => {
+    writeConfig(
+      'morpheus.jsonc',
+      `{
+        "listeners": [
+          { "name": "a", "protocol": "http", "port": 1001, "upstream": "http://127.0.0.1:1" },
+          { "name": "b", "protocol": "grpc", "port": 1001, "upstream": "h2c://127.0.0.1:2" }
+        ]
+      }`,
+    );
+    const result = loadConfig({ cwd: dir });
+    expect(result.warnings.some((w) => w.includes('share port 1001'))).toBe(true);
+  });
+
+  it('warns about duplicate listener names', () => {
+    writeConfig(
+      'morpheus.jsonc',
+      `{
+        "listeners": [
+          { "name": "dup", "protocol": "http", "port": 1001, "upstream": "http://127.0.0.1:1" },
+          { "name": "dup", "protocol": "grpc", "port": 1002, "upstream": "h2c://127.0.0.1:2" }
+        ]
+      }`,
+    );
+    const result = loadConfig({ cwd: dir });
+    expect(result.warnings.some((w) => w.includes('duplicate listener name'))).toBe(true);
   });
 
   it('warns about unknown keys but keeps going', () => {

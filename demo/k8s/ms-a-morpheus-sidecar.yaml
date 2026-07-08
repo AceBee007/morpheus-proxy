@@ -1,9 +1,13 @@
-# ms-a with morpheus-proxy as an inbound sidecar (docs/spec.md 3.2).
+# ms-a with morpheus-proxy as a bidirectional sidecar (docs/spec.md 3.2).
 #
-#   peer → ms-a istio-proxy → morpheus :18080/:15051 → ms-a app 127.0.0.1:8080/:50051
+#   inbound:  peer → ms-a istio-proxy → morpheus :18080/:15051 → ms-a app 127.0.0.1:8080/:50051
+#   outbound: ms-a app → morpheus :15052 → (istio-proxy mTLS) → ms-b:50052
 #
-# The Service targetPort points at morpheus, so all inbound traffic to ms-a is
-# proxied. morpheus forwards to the ms-a app over loopback (not istio-captured).
+# Inbound: the Service targetPort points at morpheus, so peer traffic to ms-a is
+# proxied, then forwarded to the app over loopback (not istio-captured).
+# Outbound: ms-a's downstream address (MS_B_ADDR) points at the morpheus outbound
+# listener on loopback; morpheus forwards to ms-b, which leaves the pod and is
+# mTLS-wrapped by istio. This lets morpheus intercept ms-a → ms-b calls.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -15,18 +19,25 @@ data:
       "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
         {
-          "name": "http",
+          "name": "http-in",
           "protocol": "http",
           "host": "0.0.0.0",
           "port": 18080,
           "upstream": "http://127.0.0.1:8080"
         },
         {
-          "name": "grpc",
+          "name": "grpc-in",
           "protocol": "grpc",
           "host": "0.0.0.0",
           "port": 15051,
           "upstream": "h2c://127.0.0.1:50051"
+        },
+        {
+          "name": "grpc-out-msb",
+          "protocol": "grpc",
+          "host": "127.0.0.1",
+          "port": 15052,
+          "upstream": "h2c://ms-b:50052"
         }
       ],
       "logging": {
@@ -76,10 +87,11 @@ spec:
               value: ":8080"
             - name: GRPC_ADDR
               value: ":50051"
+            # downstream calls go through the morpheus outbound listener (loopback)
             - name: MS_B_ADDR
-              value: "ms-b:50052"
+              value: "127.0.0.1:15052"
             - name: MS_B_ANIMAL_SOUND_ADDR
-              value: "ms-b:50052"
+              value: "127.0.0.1:15052"
           ports:
             - name: http
               containerPort: 8080
@@ -113,6 +125,7 @@ spec:
               containerPort: 18081
             - name: mp-grpc
               containerPort: 15051
+            # outbound listener is bound to loopback only (not a Service port)
           readinessProbe:
             httpGet:
               path: /_morpheus/healthz/ready
