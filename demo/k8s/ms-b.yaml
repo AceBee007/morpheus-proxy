@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: ms-b
-          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_OLD_REDACTED/morpheus-proxy-demo/ms-b:latest
+          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/ms-b:latest
           imagePullPolicy: Always
           env:
             - name: GRPC_ADDR

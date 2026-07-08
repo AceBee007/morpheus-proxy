@@ -32,7 +32,7 @@ spec:
       terminationGracePeriodSeconds: 100
       containers:
         - name: ms-a
-          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_OLD_REDACTED/morpheus-proxy-demo/ms-a:latest
+          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/ms-a:latest
           imagePullPolicy: Always
           lifecycle:
             preStop:
