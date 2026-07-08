@@ -177,6 +177,17 @@ function buildRoutes(): Route[] {
         sendJson(res, 200, { ...ctx.metrics.snapshot(), activeConnections: active });
       },
     },
+    // Prometheus text format (spec 4.12, proposed) at <basePath>/metrics
+    {
+      method: 'GET',
+      path: '/metrics',
+      handler: ({ res, ctx }) => {
+        const active = ctx.listeners().reduce((sum, l) => sum + l.activeConnections(), 0);
+        const body = ctx.metrics.toPrometheus(active);
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
+        res.end(body);
+      },
+    },
     // rules CRUD (spec 4.2.4)
     {
       method: 'GET',

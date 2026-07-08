@@ -530,6 +530,18 @@ describe('metrics (spec 4.12)', () => {
     expect(metrics.requestsByOutcome['passthrough']).toBe(1);
     expect(metrics.ruleHits['m']).toBe(1);
   });
+
+  it('exposes Prometheus text format at <basePath>/metrics', async () => {
+    const { stack } = await setup([mockRule('m')]);
+    await fetch(`${stack.url}/users/1`);
+    const res = await stack.api('/metrics');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+    const body = await res.text();
+    expect(body).toContain('# TYPE morpheus_requests_total counter');
+    expect(body).toMatch(/morpheus_requests_total\{outcome="mock"\} 1/);
+    expect(body).toContain('morpheus_upstream_latency_ms_bucket');
+  });
 });
 
 describe('gRPC descriptor registry API (spec 4.7.3)', () => {
