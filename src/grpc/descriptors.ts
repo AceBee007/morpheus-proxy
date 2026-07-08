@@ -111,7 +111,16 @@ export class DescriptorRegistry {
       }
     } else {
       try {
-        root = protobuf.parse(input.content, { keepCase: true }).root;
+        root = new protobuf.Root();
+        // protobuf.parse does not resolve imports. Well-known types
+        // (google/protobuf/*.proto) ship with protobufjs, so pre-register the
+        // ones the source imports; anything else still fails at resolveAll
+        // with a clear "unresolved" error (spec 4.7.3).
+        for (const match of input.content.matchAll(/import\s+(?:public\s+)?"([^"]+)"\s*;/g)) {
+          const common = protobuf.common.get(match[1] as string);
+          if (common?.nested) root.addJSON(common.nested);
+        }
+        protobuf.parse(input.content, root, { keepCase: true });
       } catch (err) {
         throw new DescriptorError(
           `failed to parse .proto source: ${err instanceof Error ? err.message : String(err)}`,
