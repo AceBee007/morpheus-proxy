@@ -402,8 +402,8 @@ function buildRoutes(): Route[] {
           throw new ApiError(400, 'invalid_mask', 'headers and jsonPaths must be string arrays');
         }
         ctx.mask.set({
-          headers: record.headers as string[],
-          jsonPaths: record.jsonPaths as string[],
+          headers: record.headers,
+          jsonPaths: record.jsonPaths,
         });
         ctx.appLog.info('mask settings updated');
         sendJson(res, 200, ctx.mask.get());

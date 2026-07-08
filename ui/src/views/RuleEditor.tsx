@@ -28,9 +28,9 @@ export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.
   const [simResult, setSimResult] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const parse = (): unknown | null => {
+  const parse = (): unknown => {
     try {
-      return JSON.parse(text);
+      return JSON.parse(text) as unknown;
     } catch (err) {
       setValidation(`JSON parse error: ${err instanceof Error ? err.message : String(err)}`);
       return null;

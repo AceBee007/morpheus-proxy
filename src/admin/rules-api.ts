@@ -124,7 +124,7 @@ export function exportRules(ctx: AdminContext, body: unknown): unknown {
     if (!Array.isArray(body['ids']) || !body['ids'].every((x) => typeof x === 'string')) {
       throw new ApiError(400, 'invalid_export', 'ids must be an array of strings');
     }
-    ids = body['ids'] as string[];
+    ids = body['ids'];
   }
   const rules = ctx.ruleStore
     .list()
@@ -185,7 +185,7 @@ export function importRules(ctx: AdminContext, body: unknown): unknown {
     );
   }
   try {
-    ctx.ruleStore.importRules(validated, mode, expectedRevision as number | undefined);
+    ctx.ruleStore.importRules(validated, mode, expectedRevision);
   } catch (err) {
     return mapStoreError(err);
   }

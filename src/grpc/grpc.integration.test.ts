@@ -76,7 +76,7 @@ beforeAll(async () => {
         callback({
           code: grpc.status.UNAVAILABLE,
           message: 'upstream says unavailable',
-        } as grpc.ServiceError);
+        });
         return;
       }
       const metadata = new grpc.Metadata();
@@ -105,7 +105,7 @@ afterAll(() => {
   upstreamServer.forceShutdown();
 });
 
-const cleanups: Array<() => Promise<unknown> | unknown> = [];
+const cleanups: Array<() => unknown> = [];
 
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();

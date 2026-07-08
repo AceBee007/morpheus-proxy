@@ -31,12 +31,18 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 
 ```sh
 npm install
-npm run check     # typecheck
+npm run check     # backend typecheck (tsc) + lint (eslint, type-checked)
+npm run lint      # backend eslint only  (lint:fix to autofix)
+npm run check:ui  # UI typecheck + lint
+npm run check:all # backend + UI
 npm test          # unit + integration tests (vitest)
 npm run build     # compile the proxy to dist/
 npm run build:ui  # build the React admin UI to ui/dist/
 npm start         # run dist/index.js
 ```
+
+Linting uses `typescript-eslint` with the type-checked ruleset (plus
+`react-hooks` / `react-refresh` for the UI).
 
 ## Configuration
 

@@ -203,7 +203,7 @@ export class DescriptorRegistry {
     if (typeof value !== 'object' || value === null) {
       throw new DescriptorError('gRPC message body must be a JSON object');
     }
-    const problem = type.verify(value as Record<string, unknown>);
+    const problem = type.verify(value);
     if (problem !== null) {
       throw new DescriptorError(`message does not match ${type.fullName}: ${problem}`);
     }

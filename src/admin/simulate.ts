@@ -43,7 +43,7 @@ function toHeaderMap(value: unknown, path: string): HeaderMap {
   for (const [name, v] of Object.entries(value)) {
     if (typeof v === 'string') headers[name.toLowerCase()] = v;
     else if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
-      headers[name.toLowerCase()] = v as string[];
+      headers[name.toLowerCase()] = v;
     } else {
       throw new ApiError(400, 'invalid_simulation', `${path}.${name} must be a string or string[]`);
     }
@@ -203,7 +203,7 @@ export async function simulateRules(deps: SimulationDeps, body: unknown): Promis
 
   const inputs: SimulationInput[] = [];
   if (logIds !== undefined) {
-    for (const logId of logIds as string[]) {
+    for (const logId of logIds) {
       inputs.push(await inputFromLog(deps, logId));
     }
   } else {

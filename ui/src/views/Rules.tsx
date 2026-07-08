@@ -6,7 +6,7 @@ import { RuleEditor } from './RuleEditor.tsx';
 function summarizeMatch(match: unknown): string {
   if (typeof match !== 'object' || match === null) return '';
   const m = match as Record<string, unknown>;
-  if (m['type'] === 'regex') return `${m['field']} ~ /${m['pattern']}/`;
+  if (m['type'] === 'regex') return `${String(m['field'])} ~ /${String(m['pattern'])}/`;
   if (m['type'] === 'all' || m['type'] === 'any') return `${m['type']}(${(m['conditions'] as unknown[])?.length ?? 0})`;
   if (m['type'] === 'script') return 'script';
   if (m['type'] === 'not') return 'not(...)';

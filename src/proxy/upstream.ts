@@ -149,7 +149,7 @@ function sendH2c(target: UpstreamTarget, init: UpstreamRequestInit): Promise<Ups
       endStream: init.body === undefined,
     });
     let trailers: HeaderMap = {};
-    stream.on('trailers', (incoming) => {
+    stream.on('trailers', (incoming: http2.IncomingHttpHeaders) => {
       trailers = fromNodeHeaders(incoming);
     });
     stream.on('error', (err: NodeJS.ErrnoException) => {

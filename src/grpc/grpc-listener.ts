@@ -11,7 +11,12 @@ import { applyGrpcResponsePatch, InvalidPatchError } from '../proxy/patch.js';
 import type { StartedListener } from '../proxy/http-listener.js';
 import type { ProxyRuntime } from '../proxy/pipeline.js';
 import { parseUpstream, sendToUpstream, UpstreamError, type UpstreamReply } from '../proxy/upstream.js';
-import { evaluateRequest, evaluateResponseMatch, type RuleErrorInfo } from '../rules/evaluate.js';
+import {
+  evaluateRequest,
+  evaluateResponseMatch,
+  type MatchedRuleInfo,
+  type RuleErrorInfo,
+} from '../rules/evaluate.js';
 import {
   matcherUsesTrailers,
   type HeaderMap,
@@ -140,7 +145,7 @@ async function handleGrpcStream(runtime: GrpcRuntime, ctx: StreamContext): Promi
 }
 
 interface LogAccumulator {
-  matched: ReturnType<typeof buildMatched>;
+  matched: MatchedRuleInfo[];
   ruleErrors: RuleErrorInfo[];
   captureRules: Rule[];
   rule: Rule | null;
@@ -148,10 +153,6 @@ interface LogAccumulator {
   timing: TimingInfo;
   forwardedDraft?: MessageDraft & { modified: boolean };
   upstreamDraft?: MessageDraft & { received: boolean };
-}
-
-function buildMatched(evaluation: Awaited<ReturnType<typeof evaluateRequest>>): Awaited<ReturnType<typeof evaluateRequest>>['matched'] {
-  return evaluation.matched;
 }
 
 function makeWriteLog(
@@ -796,7 +797,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
         path,
         authority: ctx.authority,
         headers: stripHopByHop(forwardMetadata),
-        body: stream as unknown as Readable,
+        body: stream,
         timeoutMs: runtime.limits.upstreamTimeoutMs,
       },
     );
@@ -828,7 +829,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
       grpc: { trailers: {}, ...(grpcStatusOf(reply.headers, {}).status !== undefined ? { status: grpcStatusOf(reply.headers, {}).status as number } : {}) },
     };
     const matchResult = await evaluateResponseMatch({
-      rule: rule as Rule,
+      rule: rule,
       protocol: 'grpc',
       request: requestSnapshot,
       response: responseSnapshot,
@@ -836,7 +837,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
       ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
     });
     if (matchResult.error !== undefined) {
-      acc.ruleErrors.push({ ruleId: (rule as Rule).id, stage: 'response', error: matchResult.error });
+      acc.ruleErrors.push({ ruleId: (rule).id, stage: 'response', error: matchResult.error });
     }
     headerStageMatched = matchResult.matched;
     if (headerStageMatched) {
@@ -857,7 +858,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
             stage: 'response',
             request: requestSnapshot,
             response: { statusCode: reply.statusCode, headers: reply.headers, grpc: { trailers: {} } },
-            ruleState: runtime.consume.view(rule as Rule),
+            ruleState: runtime.consume.view(rule),
             upstream: { durationMs: acc.timing.upstreamDurationMs ?? 0 },
           });
           const patchable = { metadata: outHeaders, grpcStatus: 0, trailers: {} };
@@ -865,14 +866,14 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
           outHeaders = patchable.metadata;
           if (outcome.ignoredFields.length > 0) {
             runtime.appLog.warn('script patch fields ignored for streaming grpc response', {
-              rule: (rule as Rule).id,
+              rule: (rule).id,
               fields: outcome.ignoredFields,
             });
           }
           if (outcome.changed) acc.flags.modified = true;
         } catch (err) {
           acc.ruleErrors.push({
-            ruleId: (rule as Rule).id,
+            ruleId: (rule).id,
             stage: 'response',
             error: err instanceof Error ? err.message : String(err),
           });
@@ -936,7 +937,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
           },
         };
         const matchResult = await evaluateResponseMatch({
-          rule: rule as Rule,
+          rule: rule,
           protocol: 'grpc',
           request: requestSnapshot,
           response: responseSnapshot,
@@ -944,7 +945,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
           ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
         });
         if (matchResult.error !== undefined) {
-          acc.ruleErrors.push({ ruleId: (rule as Rule).id, stage: 'response', error: matchResult.error });
+          acc.ruleErrors.push({ ruleId: (rule).id, stage: 'response', error: matchResult.error });
         }
         if (matchResult.matched) {
           const action = respStage.action;
@@ -959,7 +960,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
                 stage: 'response',
                 request: requestSnapshot,
                 response: responseSnapshot,
-                ruleState: runtime.consume.view(rule as Rule),
+                ruleState: runtime.consume.view(rule),
                 upstream: { durationMs: acc.timing.upstreamDurationMs ?? 0 },
               });
               const patchable = {
@@ -976,14 +977,14 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
               outMessage = patchable.grpcMessage;
               if (outcome.ignoredFields.length > 0) {
                 runtime.appLog.warn('script patch fields ignored after headers were sent', {
-                  rule: (rule as Rule).id,
+                  rule: (rule).id,
                   fields: outcome.ignoredFields,
                 });
               }
               if (outcome.changed) acc.flags.modified = true;
             } catch (err) {
               acc.ruleErrors.push({
-                ruleId: (rule as Rule).id,
+                ruleId: (rule).id,
                 stage: 'response',
                 error: err instanceof Error ? err.message : String(err),
               });
@@ -991,7 +992,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
           } else if (action?.type === 'response_replace') {
             runtime.appLog.warn(
               'response_replace skipped: headers already sent for streaming response',
-              { rule: (rule as Rule).id },
+              { rule: (rule).id },
             );
           }
         }

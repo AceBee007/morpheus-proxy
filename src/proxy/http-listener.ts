@@ -1,8 +1,6 @@
 import http from 'node:http';
 import http2 from 'node:http2';
 import net from 'node:net';
-import type { Readable } from 'node:stream';
-import type { HeaderMap } from '../rules/matcher.js';
 import { fromNodeHeaders, toOutgoingHeaders } from './headers.js';
 import { parseUpstream } from './upstream.js';
 import { handleHttpExchange, type HttpExchange, type ProxyRuntime } from './pipeline.js';
@@ -77,7 +75,7 @@ function h2Exchange(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttp
     rawPath: String(headers[':path'] ?? '/'),
     authority: String(headers[':authority'] ?? headers['host'] ?? ''),
     headers: fromNodeHeaders(headers),
-    bodyStream: stream as unknown as Readable,
+    bodyStream: stream,
     client: clientOf(stream.session?.socket as net.Socket),
     respond(status, outHeaders, body) {
       if (responded || stream.destroyed) return;

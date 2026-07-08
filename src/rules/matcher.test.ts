@@ -100,10 +100,10 @@ describe('evalMatcher', () => {
 
   it('delegates script matchers to the injected runner', async () => {
     const m: Matcher = { type: 'script', language: 'javascript', source: 'return true;' };
-    const result = await evalMatcher(m, httpInput(), async (matcher, input) => {
+    const result = await evalMatcher(m, httpInput(), (matcher, input) => {
       expect(matcher.source).toBe('return true;');
       expect(input.request.path).toBe('/users/42');
-      return input.request.method === 'GET';
+      return Promise.resolve(input.request.method === 'GET');
     });
     expect(result).toBe(true);
   });
@@ -115,9 +115,9 @@ describe('evalMatcher', () => {
 
   it('passes the runner to scripts nested inside composite matchers (complex matcher)', async () => {
     const seen: string[] = [];
-    const runner = async (matcher: { source: string }): Promise<boolean> => {
+    const runner = (matcher: { source: string }): Promise<boolean> => {
       seen.push(matcher.source);
-      return matcher.source.includes('yes');
+      return Promise.resolve(matcher.source.includes('yes'));
     };
     // script deep inside all(any(not(script)))
     const nested: Matcher = {
@@ -140,9 +140,9 @@ describe('evalMatcher', () => {
 
   it('short-circuits all() before reaching a nested script when an earlier condition fails', async () => {
     let called = false;
-    const runner = async (): Promise<boolean> => {
+    const runner = (): Promise<boolean> => {
       called = true;
-      return true;
+      return Promise.resolve(true);
     };
     const m: Matcher = {
       type: 'all',
@@ -156,7 +156,7 @@ describe('evalMatcher', () => {
   });
 
   it('not() inverts a nested script result', async () => {
-    const runner = async (): Promise<boolean> => true;
+    const runner = (): Promise<boolean> => Promise.resolve(true);
     const m: Matcher = {
       type: 'not',
       condition: { type: 'script', language: 'javascript', source: 'return true' },

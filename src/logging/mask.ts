@@ -22,7 +22,7 @@ function applyPath(node: unknown, segments: string[]): void {
   }
   const head = segments[0] as string;
   const rest = segments.slice(1);
-  const record = node as Record<string, unknown>;
+  const record = node;
   const keys = head === '*' ? Object.keys(record) : head in record ? [head] : [];
   for (const key of keys) {
     if (rest.length === 0) {

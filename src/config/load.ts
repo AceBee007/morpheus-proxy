@@ -92,7 +92,7 @@ class SectionReader {
     if (!(key in this.raw)) return fallback;
     const value = this.raw[key];
     if (Array.isArray(value) && value.every((v) => typeof v === 'string')) {
-      return value as string[];
+      return value;
     }
     this.warn(key, 'an array of strings', value);
     return fallback;

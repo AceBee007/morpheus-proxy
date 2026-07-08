@@ -30,7 +30,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (v: 'logs') => void }): 
       }
     };
     void load();
-    const timer = setInterval(load, 2000);
+    const timer = setInterval(() => void load(), 2000);
     return () => {
       alive = false;
       clearInterval(timer);

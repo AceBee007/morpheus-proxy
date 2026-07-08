@@ -25,7 +25,7 @@ import type {
   ScriptMatcherRunner,
 } from '../rules/matcher.js';
 import type { RuleStore } from '../rules/store.js';
-import type { FaultSpec, Rule, ScriptManipulatorAction } from '../rules/types.js';
+import type { FaultSpec, ScriptManipulatorAction } from '../rules/types.js';
 import type { MetricsRegistry } from '../observability/metrics.js';
 import { applyDelay, applyResponseReplace, applyRewriteOperations } from './actions.js';
 import {
