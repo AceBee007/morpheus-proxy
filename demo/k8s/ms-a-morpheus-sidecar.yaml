@@ -1,0 +1,168 @@
+# ms-a with morpheus-proxy as an inbound sidecar (docs/spec.md 3.2).
+#
+#   peer → ms-a istio-proxy → morpheus :18080/:15051 → ms-a app 127.0.0.1:8080/:50051
+#
+# The Service targetPort points at morpheus, so all inbound traffic to ms-a is
+# proxied. morpheus forwards to the ms-a app over loopback (not istio-captured).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: morpheus-proxy-config
+  namespace: morpheus-proxy-demo
+data:
+  morpheus.jsonc: |
+    {
+      "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
+      "listeners": [
+        {
+          "name": "http",
+          "protocol": "http",
+          "host": "0.0.0.0",
+          "port": 18080,
+          "upstream": "http://127.0.0.1:8080"
+        },
+        {
+          "name": "grpc",
+          "protocol": "grpc",
+          "host": "0.0.0.0",
+          "port": 15051,
+          "upstream": "h2c://127.0.0.1:50051"
+        }
+      ],
+      "logging": {
+        "trafficLogDir": "/tmp/morpheus/traffic",
+        "appLogDir": "/tmp/morpheus/app"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app: ms-a
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+    version: main
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ms-a
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: ms-a
+        sidecar.istio.io/proxyCPU: "125m"
+        sidecar.istio.io/proxyCPULimit: "300m"
+        sidecar.istio.io/proxyMemory: "256Mi"
+        sidecar.istio.io/proxyMemoryLimit: "256Mi"
+        traffic.sidecar.istio.io/excludeOutboundIPRanges: 169.254.169.254/32
+      labels:
+        app: ms-a
+        app.kubernetes.io/name: ms-a
+        app.kubernetes.io/part-of: morpheus-proxy-demo
+        sidecar.istio.io/inject: "true"
+        version: main
+    spec:
+      containers:
+        # --- application (unchanged; morpheus reaches it over loopback) ---
+        - name: ms-a
+          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/ms-a:latest
+          imagePullPolicy: Always
+          env:
+            - name: HTTP_ADDR
+              value: ":8080"
+            - name: GRPC_ADDR
+              value: ":50051"
+            - name: MS_B_ADDR
+              value: "ms-b:50052"
+            - name: MS_B_ANIMAL_SOUND_ADDR
+              value: "ms-b:50052"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+        # --- morpheus-proxy inbound sidecar ---
+        - name: morpheus-proxy
+          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/morpheus-proxy:latest
+          imagePullPolicy: Always
+          env:
+            - name: MORPHEUS_CONFIG
+              value: /etc/morpheus/morpheus.jsonc
+          ports:
+            - name: mp-http
+              containerPort: 18080
+            - name: mp-admin
+              containerPort: 18081
+            - name: mp-grpc
+              containerPort: 15051
+          readinessProbe:
+            httpGet:
+              path: /_morpheus/healthz/ready
+              port: 18081
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_morpheus/healthz/live
+              port: 18081
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: morpheus-config
+              mountPath: /etc/morpheus
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: morpheus-config
+          configMap:
+            name: morpheus-proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app: ms-a
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+    version: main
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ms-a
+  ports:
+    # inbound traffic now lands on morpheus, which forwards to the ms-a app
+    - name: http
+      port: 8080
+      targetPort: 18080
+    - name: grpc
+      port: 50051
+      targetPort: 15051
+    # optional: reach the morpheus admin API / UI in-cluster
+    - name: mp-admin
+      port: 18081
+      targetPort: 18081
