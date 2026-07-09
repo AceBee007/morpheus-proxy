@@ -82,5 +82,7 @@ Endpoints (default base path `/_morpheus`, admin port `18081`):
   secondary reference: reverse mode (inbound + per-downstream outbound)
 - [docs/how-to-setup.md](docs/how-to-setup.md) — step-by-step guide for adding
   morpheus to an existing dev service
+- [docs/tutorial.md](docs/tutorial.md) — walkthrough for verifying morpheus in
+  a deployed environment, with UI screenshots at each step
 
 The multi-stage [Dockerfile](Dockerfile) builds both the proxy and the UI.
