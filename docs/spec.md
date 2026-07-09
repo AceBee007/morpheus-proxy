@@ -1589,7 +1589,7 @@ UI は proxy の現在状態を可視化し、テスト中に素早く rule を�
 | Rule Editor | matcher / request / response / consume 設定、script 編集、validation、simulation |
 | Logs | request / response log 一覧、filter、詳細、diff、raw download |
 | gRPC Descriptors | descriptor 登録、service / method 確認 |
-| Settings | log retention 表示、mask 設定編集、script sandbox 状態 |
+| Settings | log retention 表示、mask 設定編集、script sandbox 状態、log 表示 timezone 設定 |
 
 ### 5.3 Rules 画面
 
@@ -1683,7 +1683,7 @@ Filter:
 
 表示:
 
-- timestamp
+- timestamp(`YYYY/MM/DD-HH:MM:SS.sss-nnnnn` 形式。`nnnnn` はその log の連番(id 末尾の数字を5桁 0 埋め)で、同一ミリ秒内の複数 log を一意に区別する。サーバーが送る `startedAt` は常に UTC で、表示 timezone への変換は client 側で行う。表示 timezone は Settings(5.2)で選択でき、未指定時は browser 検出、検出不能時は UTC を使う)
 - duration
 - protocol
 - method/path or gRPC method

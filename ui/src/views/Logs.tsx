@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type LogEntry } from '../api.ts';
 import { useToast } from '../toast.tsx';
+import { formatLogTimestamp, resolveTimeZone } from '../time.ts';
 
 const OUTCOMES = ['', 'captured', 'mock', 'fault', 'modified', 'delayed', 'upstream_error', 'rule_error'];
 
@@ -11,6 +12,7 @@ export function Logs(): JSX.Element {
   const [live, setLive] = useState(true);
   const [filters, setFilters] = useState({ protocol: '', outcome: '', path: '', contains: '' });
   const esRef = useRef<EventSource | null>(null);
+  const timeZone = useMemo(() => resolveTimeZone(), []);
 
   const buildQuery = useCallback((): string => {
     const params = new URLSearchParams();
@@ -108,12 +110,15 @@ export function Logs(): JSX.Element {
       <div className="card">
         <table>
           <thead>
-            <tr><th>Time</th><th>Proto</th><th>Method/Path</th><th>Outcome</th><th>Status</th><th>Dur</th><th>Rules</th></tr>
+            <tr>
+              <th>Time <span className="muted" style={{ fontWeight: 400, textTransform: 'none' }}>({timeZone})</span></th>
+              <th>Proto</th><th>Method/Path</th><th>Outcome</th><th>Status</th><th>Dur</th><th>Rules</th>
+            </tr>
           </thead>
           <tbody>
             {items.map((entry) => (
               <tr key={entry.id} className="clickable" onClick={() => setSelected(entry)}>
-                <td className="mono" style={{ fontSize: 11 }}>{entry.startedAt.slice(11, 23)}</td>
+                <td className="mono" style={{ fontSize: 11 }}>{formatLogTimestamp(entry.startedAt, entry.id, timeZone)}</td>
                 <td><span className="tag">{entry.protocol}</span></td>
                 <td className="mono" style={{ fontSize: 12 }}>{entry.request.method} {entry.request.path}</td>
                 <td><span className={`tag ${entry.outcome}`}>{entry.outcome}</span></td>

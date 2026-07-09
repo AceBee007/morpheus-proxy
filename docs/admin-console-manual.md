@@ -152,6 +152,8 @@ script の `ctx` と manipulator patch の形式は [api-manual.md](api-manual.m
 Logs 画面では traffic log の一覧、filter、detail、body download、simulation を扱います。
 unmatched passthrough traffic は保存されないため、まず Capture traffic rule または intercept rule を入れてから確認してください。
 
+一覧の `Time` 列は `YYYY/MM/DD-HH:MM:SS.sss-nnnnn` 形式で表示されます(`nnnnn` は同一ミリ秒内の log を一意に区別する連番)。表示する timezone は Settings(8章)で設定でき、列見出しに現在の timezone が表示されます。サーバーが保持・送信する `startedAt` は常に UTC で、選択した timezone への変換は browser 側で行われます。
+
 上部操作:
 
 - `Live` / `Paused`: SSE による realtime 受信を pause / resume します。
@@ -216,10 +218,11 @@ descriptor がない場合は metadata、path、grpc-status 中心の rule を�
 
 ## 8. Settings
 
-Settings 画面では runtime の redaction / masking を編集できます。
+Settings 画面では runtime の redaction / masking、Logs 画面の表示 timezone を編集できます。
 
 項目:
 
+- Timezone: Logs 画面の `Time` 列を表示する timezone
 - Masked headers: 1 行 1 header name
 - Masked JSON paths: 1 行 1 JSONPath(例 `$.password`、`$.credentials.*`)
 - Log retention: status API が返す retention 設定の表示(編集は config)
@@ -228,6 +231,8 @@ Settings 画面では runtime の redaction / masking を編集できます。
 `Save mask settings` を押すと現在の mask 設定全体を置き換えます。変更は on-memory で、再起動すると config の `logging.mask` に戻ります。
 
 mask は logged headers、JSON body preview、decoded gRPC body preview に適用されます。raw body file には適用されないため、保存対象が capture / intercepted traffic に限定されていることが leak surface の抑えになっています。
+
+Timezone は `Display timezone` から IANA timezone 名を選び、`Save timezone` で確定します。この設定は browser の LocalStorage にのみ保存され、サーバーには送信されません(サーバーが保持・送信する時刻データは常に UTC のまま)。選択を保存しない場合は `Auto-detect` のまま browser の設定から推定した timezone が使われ、推定にも失敗した場合は UTC 表示になります。設定は保存した browser / 端末単位で有効です。
 
 ## 9. 典型的な操作フロー
 
