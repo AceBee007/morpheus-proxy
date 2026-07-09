@@ -1,0 +1,27 @@
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  name: morpheus-proxy-demo
+  namespace: istio-system
+spec:
+  profile: default
+  components:
+    cni:
+      enabled: true
+      namespace: istio-system
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: false
+    egressGateways:
+      - name: istio-egressgateway
+        enabled: false
+  values:
+    global:
+      platform: gke
+    pilot:
+      cni:
+        enabled: true
+    cni:
+      excludeNamespaces:
+        - istio-system
+        - kube-system

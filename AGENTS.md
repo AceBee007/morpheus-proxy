@@ -15,3 +15,6 @@ repository should keep Git history clean and useful.
 
 - Use [agents/git-checkpoint-agent.md](agents/git-checkpoint-agent.md) when a
   task needs explicit branch, staging, commit, push, or PR checkpoint handling.
+- After completing each requested task, delegate Git checkpoint work to the
+  dedicated Git checkpoint sub-agent and have it create a commit for the
+  completed work, unless the user explicitly asks not to commit.

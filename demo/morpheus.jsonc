@@ -1,0 +1,31 @@
+// morpheus-proxy config for the local docker compose demo (docs/spec.md 4.14).
+// Unlike config/default.jsonc (a reference of all settings and their
+// defaults, never loaded), this file IS loaded: docker-compose.yml mounts it
+// and points MORPHEUS_CONFIG at it. Omitted sections use the defaults
+// documented in config/default.jsonc.
+//
+// A single CONNECT egress listener: ms-a dials its downstreams through this
+// proxy (GRPC_PROXY_ADDR=morpheus-proxy:15052) with its real downstream
+// addresses UNCHANGED. morpheus reads the CONNECT authority (ms-b:50052) as the
+// per-connection upstream, runs the rule pipeline on the plaintext h2c, then
+// forwards to the real downstream.
+//
+// NOTE: host is 0.0.0.0 here because in docker compose ms-a reaches morpheus
+// over the compose network (morpheus-proxy:15052), not over loopback. In a k8s
+// pod (same-pod sidecar) it would be 127.0.0.1 — see demo/k8s/ms-a-morpheus-connect.yaml.
+{
+  "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
+  "listeners": [
+    {
+      "name": "grpc-egress",
+      "protocol": "grpc",
+      "host": "0.0.0.0",
+      "port": 15052,
+      "mode": "connect"
+    }
+  ],
+  "logging": {
+    "trafficLogDir": "/tmp/morpheus/traffic",
+    "appLogDir": "/tmp/morpheus/app"
+  }
+}

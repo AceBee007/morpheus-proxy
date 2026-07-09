@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app: ms-a
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+    version: main
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ms-a
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: ms-a
+        sidecar.istio.io/proxyCPU: "125m"
+        sidecar.istio.io/proxyCPULimit: "300m"
+        sidecar.istio.io/proxyMemory: "256Mi"
+        sidecar.istio.io/proxyMemoryLimit: "256Mi"
+        traffic.sidecar.istio.io/excludeOutboundIPRanges: 169.254.169.254/32
+      labels:
+        app: ms-a
+        app.kubernetes.io/name: ms-a
+        app.kubernetes.io/part-of: morpheus-proxy-demo
+        sidecar.istio.io/inject: "true"
+        version: main
+    spec:
+      terminationGracePeriodSeconds: 100
+      containers:
+        - name: ms-a
+          image: asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/morpheus-proxy-demo/ms-a:latest
+          imagePullPolicy: Always
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 30; wget -qO- --post-data '' localhost:15000/healthcheck/fail; sleep 45; wget -qO- --post-data '' localhost:15000/healthcheck/ok
+          env:
+            - name: HTTP_ADDR
+              value: ":8080"
+            - name: GRPC_ADDR
+              value: ":50051"
+            - name: MS_B_ADDR
+              value: "ms-b:50052"
+            - name: MS_B_ANIMAL_SOUND_ADDR
+              value: "ms-b:50052"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app: ms-a
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+    version: main
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ms-a
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: grpc
+      port: 50051
+      targetPort: grpc

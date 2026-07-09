@@ -1,0 +1,47 @@
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+spec:
+  host: ms-a.morpheus-proxy-demo.svc.cluster.local
+  subsets:
+    - name: main
+      labels:
+        version: main
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ms-a
+  namespace: morpheus-proxy-demo
+  labels:
+    app.kubernetes.io/name: ms-a
+    app.kubernetes.io/part-of: morpheus-proxy-demo
+spec:
+  hosts:
+    - ms-a.morpheus-proxy-demo.svc.cluster.local
+  http:
+    - name: http
+      match:
+        - port: 8080
+      route:
+        - destination:
+            host: ms-a.morpheus-proxy-demo.svc.cluster.local
+            port:
+              number: 8080
+            subset: main
+          weight: 100
+    - name: grpc
+      match:
+        - port: 50051
+      route:
+        - destination:
+            host: ms-a.morpheus-proxy-demo.svc.cluster.local
+            port:
+              number: 50051
+            subset: main
+          weight: 100
