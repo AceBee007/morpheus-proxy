@@ -57,7 +57,7 @@ spec:
     spec:
       containers:
         - name: morpheus-proxy
-          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_OLD_REDACTED/morpheus-proxy-demo/morpheus-proxy:latest
+          image: asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/morpheus-proxy-demo/morpheus-proxy:latest
           imagePullPolicy: Always
           env:
             - name: MORPHEUS_CONFIG

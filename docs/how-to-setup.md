@@ -185,6 +185,14 @@ demo の完成形マニフェスト(CONNECT 方式、GKE + Istio で検証済み
 [demo/k8s/ms-a-morpheus-connect.yaml](../demo/k8s/ms-a-morpheus-connect.yaml) を参照。
 docker compose で動くローカル版は [demo/README.md](../demo/README.md)。
 
+> `demo/k8s/*.yaml` の image は project 部分を `${GCP_PROJECT_ID}` で参照しています。適用前に
+> 自分の project id で展開してください:
+>
+> ```sh
+> export GCP_PROJECT_ID=<your-project-id>
+> envsubst < demo/k8s/ms-a-morpheus-connect.yaml | kubectl --context=$CTX apply -f -
+> ```
+
 ## 7. 動作確認
 
 ```sh

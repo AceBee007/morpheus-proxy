@@ -86,7 +86,7 @@ spec:
       containers:
         # --- application (unchanged; morpheus reaches it over loopback) ---
         - name: ms-a
-          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/ms-a:latest
+          image: asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/morpheus-proxy-demo/ms-a:latest
           imagePullPolicy: Always
           env:
             - name: HTTP_ADDR
@@ -119,7 +119,7 @@ spec:
               memory: 512Mi
         # --- morpheus-proxy sidecar (serves both inbound and outbound listeners) ---
         - name: morpheus-proxy
-          image: asia-northeast1-docker.pkg.dev/GCP_PROJECT_ID_REDACTED/morpheus-proxy-demo/morpheus-proxy:latest
+          image: asia-northeast1-docker.pkg.dev/${GCP_PROJECT_ID}/morpheus-proxy-demo/morpheus-proxy:latest
           imagePullPolicy: Always
           env:
             - name: MORPHEUS_CONFIG

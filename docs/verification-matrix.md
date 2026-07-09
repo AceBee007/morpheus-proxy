@@ -3,11 +3,9 @@
 docs/spec.md の各要件について「実装 → unit test → 実機/UI 検証」の対応を示す。
 
 - **Unit**: 該当機能を検証する vitest テスト(合計 236 件 / 19 ファイル、`npm test`)
-- **GKE**: GCP `GCP_PROJECT_ID_REDACTED`(ms-a 両方向サイドカー)での実 traffic 検証
+- **GKE**: GCP `<GCP_PROJECT_ID>`(ms-a 両方向サイドカー)での実 traffic 検証
 - **UI**: playwright-mcp による実デプロイの UI 操作検証
 
-> 注: goal 記載の GKE workspace `GCP_PROJECT_ID_OLD_REDACTED` は期限切れで削除済みのため使用不可。
-> 現行の tmp project `GCP_PROJECT_ID_REDACTED`(2026-08-07 頃期限)で検証した。
 
 ## spec 4.x トレーサビリティ
 
@@ -52,14 +50,14 @@ docs/spec.md の各要件について「実装 → unit test → 実機/UI 検�
 
 ## UI 画面別 playwright 検証(GKE 実デプロイ)
 
-| 画面 | 確認内容 |
-| --- | --- |
-| Dashboard | listeners(http-in/grpc-in/grpc-out-msb)、requestsByOutcome、script sandbox 状態 |
-| Rules | 一覧、New rule、revision 表示 |
-| Rule Editor | simple/advanced/script の 3 モード、template picker、Format/Validate/Simulate、書き込み経路(create 201→delete 200) |
-| Logs | realtime、outbound fault エントリ表示、log detail |
-| gRPC Descriptors | 登録フォーム、登録済み service/method 表示 |
-| Settings | mask 設定(headers/jsonPaths)表示・保存 |
+| 画面             | 確認内容                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Dashboard        | listeners(http-in/grpc-in/grpc-out-msb)、requestsByOutcome、script sandbox 状態                                    |
+| Rules            | 一覧、New rule、revision 表示                                                                                      |
+| Rule Editor      | simple/advanced/script の 3 モード、template picker、Format/Validate/Simulate、書き込み経路(create 201→delete 200) |
+| Logs             | realtime、outbound fault エントリ表示、log detail                                                                  |
+| gRPC Descriptors | 登録フォーム、登録済み service/method 表示                                                                         |
+| Settings         | mask 設定(headers/jsonPaths)表示・保存                                                                             |
 
 ## アーキテクチャ / Best Practice メモ
 
