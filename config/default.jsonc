@@ -1,9 +1,15 @@
-// morpheus-proxy default configuration.
+// morpheus-proxy default configuration — REFERENCE ONLY (not loaded).
 //
-// Every value below matches the hard coded defaults built into the app
-// (enforced by src/config/defaults.test.ts). The app starts with these values
-// when no config file is given; individual invalid keys also fall back to
-// these values with a warning (docs/spec.md section 4.13).
+// The app never reads this file. It documents every setting together with its
+// hard coded default (kept identical by src/config/defaults.test.ts):
+// starting the app without a config behaves exactly as written here, and
+// individual invalid keys fall back to these values with a warning
+// (docs/spec.md section 4.13).
+//
+// To actually configure the app, pass a file via --config <path> or
+// MORPHEUS_CONFIG, or place morpheus.jsonc in the working directory.
+// For a working example (docker compose CONNECT egress demo), see
+// demo/morpheus.jsonc.
 {
   "admin": {
     "host": "127.0.0.1",

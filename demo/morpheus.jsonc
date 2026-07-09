@@ -1,4 +1,8 @@
 // morpheus-proxy config for the local docker compose demo (docs/spec.md 4.14).
+// Unlike config/default.jsonc (a reference of all settings and their
+// defaults, never loaded), this file IS loaded: docker-compose.yml mounts it
+// and points MORPHEUS_CONFIG at it. Omitted sections use the defaults
+// documented in config/default.jsonc.
 //
 // A single CONNECT egress listener: ms-a dials its downstreams through this
 // proxy (GRPC_PROXY_ADDR=morpheus-proxy:15052) with its real downstream

@@ -97,6 +97,8 @@ data:
 ```
 
 - `name` と `port` は listener ごとに一意にしてください
+- 設定できる全 key と既定値は [config/default.jsonc](../config/default.jsonc) を参照してください。
+  このファイルは既定値のリファレンスで、アプリが読み込むことはありません(書かなかった key はその既定値で動きます)
 - 恒久的に効かせたいルールがある場合は `rules.presets`（配列、要素は rule 定義）に書けます。
   ルールは on-memory で Pod 再起動時に消えるため、常設ルールは presets、実験は admin API を使い分けます
 - gRPC の body(message)を扱うルールには descriptor 登録が必要です(spec 4.7)
