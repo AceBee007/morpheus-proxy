@@ -1,0 +1,44 @@
+{
+  "name": "morpheus-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Inspect / intercept / mock / fault-injection proxy for testing environments",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "build:ui": "npm --prefix ui install && npm --prefix ui run build",
+    "build:all": "npm run build && npm run build:ui",
+    "lint": "eslint \"src/**/*.ts\"",
+    "lint:fix": "eslint \"src/**/*.ts\" --fix",
+    "check": "tsc --noEmit -p tsconfig.json && npm run lint",
+    "check:ui": "npm --prefix ui run check",
+    "check:all": "npm run check && npm run check:ui",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=24.16.0"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "protobufjs": "^8.7.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
+    "@types/node": "24.12.4",
+    "eslint": "^9.39.4",
+    "globals": "^17.7.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true,
+    "protobufjs@7.6.5": true,
+    "protobufjs@8.7.0": true
+  }
+}

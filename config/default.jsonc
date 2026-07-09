@@ -1,0 +1,81 @@
+// morpheus-proxy default configuration — REFERENCE ONLY (not loaded).
+//
+// The app never reads this file. It documents every setting together with its
+// hard coded default (kept identical by src/config/defaults.test.ts):
+// starting the app without a config behaves exactly as written here, and
+// individual invalid keys fall back to these values with a warning
+// (docs/spec.md section 4.13).
+//
+// To actually configure the app, pass a file via --config <path> or
+// MORPHEUS_CONFIG, or place morpheus.jsonc in the working directory.
+// For a working example (docker compose CONNECT egress demo), see
+// demo/morpheus.jsonc.
+{
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 18081,
+    // Change this prefix if it would collide with paths of the real service.
+    "basePath": "/_morpheus"
+  },
+  // Each listener has a protocol (http/grpc) and an optional ingress "mode":
+  //   "reverse" (default): forward to the fixed "upstream" below.
+  //   "connect": accept an HTTP CONNECT tunnel and use the CONNECT authority as
+  //     the per-connection upstream, so one listener can intercept a client's
+  //     outbound calls to many downstreams via a single client proxy setting
+  //     (e.g. GRPC_PROXY_ADDR / HTTPS_PROXY); "upstream" is then ignored. See
+  //     docs/spec.md 4.14. Example:
+  //       { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1",
+  //         "port": 15052, "mode": "connect" }
+  "listeners": [
+    {
+      "name": "http",
+      "protocol": "http",
+      "host": "0.0.0.0",
+      "port": 18080,
+      "upstream": "http://127.0.0.1:8080",
+      "decodeBody": false,
+      "descriptors": [],
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    },
+    {
+      "name": "grpc",
+      "protocol": "grpc",
+      "host": "0.0.0.0",
+      "port": 15051,
+      "upstream": "h2c://127.0.0.1:50051",
+      "decodeBody": false,
+      // Descriptor files are required for gRPC body decode/edit.
+      "descriptors": [],
+      "maxRequestBodyBufferBytes": 1048576,
+      "maxResponseBodyBufferBytes": 1048576
+    }
+  ],
+  "rules": {
+    // Rule definitions loaded at startup. Empty by default.
+    "presets": []
+  },
+  "script": {
+    "sandbox": "subprocess",
+    "defaultTimeoutMs": 3000,
+    "maxTimeoutMs": 60000
+  },
+  "limits": {
+    "maxConcurrentConnections": 1024,
+    "maxActiveStreams": 1024,
+    "upstreamTimeoutMs": 30000,
+    "idleTimeoutMs": 60000
+  },
+  "logging": {
+    "trafficLogDir": "logs/morpheus-proxy/traffic",
+    "appLogDir": "logs/morpheus-proxy/app",
+    "trafficMaxEntries": 1000,
+    "trafficMaxBytes": 104857600,
+    "trafficRetentionMs": 86400000,
+    "appRetentionMs": 86400000,
+    "mask": {
+      "headers": ["authorization", "cookie", "set-cookie", "x-api-key"],
+      "jsonPaths": ["$.password", "$.token", "$.credentials.*"]
+    }
+  }
+}

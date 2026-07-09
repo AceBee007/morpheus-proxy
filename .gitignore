@@ -40,6 +40,7 @@ pids/
 .parcel-cache/
 .eslintcache
 .nyc_output/
+.playwright-mcp/
 
 # TypeScript / framework caches
 .next/
