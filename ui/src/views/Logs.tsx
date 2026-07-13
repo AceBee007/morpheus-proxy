@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type LogEntry } from '../api.ts';
 import { useToast } from '../toast.tsx';
 import { formatLogTimestamp, resolveTimeZone } from '../time.ts';
+import { JsonBlock } from '../JsonBlock.tsx';
 
 const OUTCOMES = ['', 'captured', 'mock', 'fault', 'modified', 'delayed', 'upstream_error', 'rule_error'];
 
@@ -165,12 +166,12 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
           <div>
             <h4>Request</h4>
             <div className="mono muted" style={{ fontSize: 12 }}>{entry.request.method} {entry.request.path}</div>
-            <pre>{JSON.stringify(entry.request.headers, null, 2)}</pre>
-            {entry.request.bodyLogged ? <pre>{entry.request.bodyPreview}</pre> : <div className="muted">body not logged</div>}
+            <JsonBlock value={entry.request.headers} />
+            {entry.request.bodyLogged ? <JsonBlock value={entry.request.bodyPreview} /> : <div className="muted">body not logged</div>}
             {entry.forwardedRequest?.modified && (
               <>
                 <h4>Forwarded (modified)</h4>
-                {entry.forwardedRequest.bodyPreview && <pre>{entry.forwardedRequest.bodyPreview}</pre>}
+                {entry.forwardedRequest.bodyPreview && <JsonBlock value={entry.forwardedRequest.bodyPreview} />}
               </>
             )}
           </div>
@@ -179,12 +180,12 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
             <div className="mono muted" style={{ fontSize: 12 }}>
               status {entry.response.statusCode ?? entry.response.grpcStatus}
             </div>
-            <pre>{JSON.stringify(entry.response.headers, null, 2)}</pre>
-            {entry.response.bodyLogged ? <pre>{entry.response.bodyPreview}</pre> : <div className="muted">body not logged</div>}
+            <JsonBlock value={entry.response.headers} />
+            {entry.response.bodyLogged ? <JsonBlock value={entry.response.bodyPreview} /> : <div className="muted">body not logged</div>}
             {entry.upstreamResponse?.bodyPreview && (
               <>
                 <h4>Upstream response</h4>
-                <pre>{entry.upstreamResponse.bodyPreview}</pre>
+                <JsonBlock value={entry.upstreamResponse.bodyPreview} />
               </>
             )}
           </div>
@@ -193,13 +194,13 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
         {entry.ruleErrors && entry.ruleErrors.length > 0 && (
           <div className="field">
             <label>Rule errors</label>
-            <pre>{JSON.stringify(entry.ruleErrors, null, 2)}</pre>
+            <JsonBlock value={entry.ruleErrors} />
           </div>
         )}
 
         <div className="field">
           <label>Matched rules & timing</label>
-          <pre>{JSON.stringify({ matchedRules: entry.matchedRules, timing: entry.timing }, null, 2)}</pre>
+          <JsonBlock value={{ matchedRules: entry.matchedRules, timing: entry.timing }} />
         </div>
 
         <div className="row">
@@ -212,7 +213,7 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
             <a className="btn ghost" href={api.logBodyUrl(entry.id, 'response')} target="_blank" rel="noreferrer">Download response body</a>
           )}
         </div>
-        {sim && <pre style={{ marginTop: 12 }}>{sim}</pre>}
+        {sim && <JsonBlock value={sim} style={{ marginTop: 12 }} />}
         <div className="field" style={{ marginTop: 12 }}>
           <label>{entry.protocol === 'grpc' ? 'grpcurl' : 'curl'}</label>
           <pre>{curl}</pre>

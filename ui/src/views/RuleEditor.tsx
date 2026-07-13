@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, type Rule } from '../api.ts';
 import { useToast } from '../toast.tsx';
 import { TEMPLATES } from '../templates.ts';
+import { JsonBlock } from '../JsonBlock.tsx';
 
 type Mode = 'simple' | 'advanced' | 'script';
 
@@ -127,11 +128,11 @@ export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.
           <button className="btn" disabled={saving} onClick={save}>{initial ? 'Save changes' : 'Create rule'}</button>
         </div>
 
-        {validation && <pre style={{ marginTop: 12 }}>{validation}</pre>}
+        {validation && <JsonBlock value={validation} style={{ marginTop: 12 }} />}
         {simResult && (
           <div className="field" style={{ marginTop: 12 }}>
             <label>Simulation result</label>
-            <pre>{simResult}</pre>
+            <JsonBlock value={simResult} />
           </div>
         )}
         {mode === 'script' && (

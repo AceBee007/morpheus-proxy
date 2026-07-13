@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
+import { JsonBlock } from '../JsonBlock.tsx';
 
 function Stat({ label, value }: { label: string; value: string | number }): JSX.Element {
   return (
@@ -92,7 +93,7 @@ export function Dashboard({ onNavigate }: { onNavigate: (v: 'logs') => void }): 
 
       <div className="card" style={{ marginTop: 16 }}>
         <h3 style={{ marginTop: 0 }}>Script sandbox</h3>
-        <pre>{JSON.stringify(status?.['scriptSandbox'] ?? {}, null, 2)}</pre>
+        <JsonBlock value={status?.['scriptSandbox'] ?? {}} />
       </div>
     </div>
   );
