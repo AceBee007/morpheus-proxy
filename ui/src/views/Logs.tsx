@@ -153,7 +153,7 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
         <div className="row">
           <h2 style={{ margin: 0 }}>Log {entry.id}</h2>
           <span className={`tag ${entry.outcome}`}>{entry.outcome}</span>
@@ -161,7 +161,7 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
           <button className="btn ghost" onClick={onClose}>Close</button>
         </div>
 
-        <div className="split" style={{ marginTop: 12 }}>
+        <div className="split wrap" style={{ marginTop: 12 }}>
           <div>
             <h4>Request</h4>
             <div className="mono muted" style={{ fontSize: 12 }}>{entry.request.method} {entry.request.path}</div>
