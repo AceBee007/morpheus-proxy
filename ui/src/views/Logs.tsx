@@ -143,12 +143,20 @@ export function Logs(): JSX.Element {
         </table>
       </div>
 
-      {selected && <LogDetail entry={selected} onClose={() => setSelected(null)} />}
+      {selected && <LogDetail entry={selected} timeZone={timeZone} onClose={() => setSelected(null)} />}
     </div>
   );
 }
 
-function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void }): JSX.Element {
+function LogDetail({
+  entry,
+  timeZone,
+  onClose,
+}: {
+  entry: LogEntry;
+  timeZone: string;
+  onClose: () => void;
+}): JSX.Element {
   const [sim, setSim] = useState<string | null>(null);
 
   const simulate = async (): Promise<void> => {
@@ -166,7 +174,7 @@ function LogDetail({ entry, onClose }: { entry: LogEntry; onClose: () => void })
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal wide" onClick={(e) => e.stopPropagation()}>
         <div className="row">
-          <h2 style={{ margin: 0 }}>Log {entry.id}</h2>
+          <h2 style={{ margin: 0 }}>Log {formatLogTimestamp(entry.startedAt, entry.id, timeZone)}</h2>
           <span className={`tag ${entry.outcome}`}>{entry.outcome}</span>
           <div className="spacer" />
           <button className="btn ghost" onClick={onClose}>Close</button>
