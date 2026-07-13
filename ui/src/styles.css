@@ -119,7 +119,7 @@ tr.clickable:hover td { background: var(--panel-2); }
 }
 .tag.mock { color: #79c0ff; }
 .tag.fault, .tag.upstream_error, .tag.rule_error { color: var(--err); }
-.tag.modified { color: var(--warn); }
+.tag.modified, .tag.client_aborted { color: var(--warn); }
 .tag.captured, .tag.delayed { color: var(--muted); }
 .tag.passthrough { color: var(--muted); }
 
@@ -135,6 +135,11 @@ pre {
   font-size: 12px;
   max-height: 320px;
 }
+.hljs { background: none; color: inherit; }
+.hljs-attr { color: var(--accent); }
+.hljs-string { color: var(--ok); }
+.hljs-number, .hljs-literal, .hljs-keyword { color: var(--warn); }
+.hljs-punctuation { color: var(--muted); }
 
 .toast {
   position: fixed;
@@ -169,6 +174,11 @@ pre {
   width: 100%;
   max-width: 860px;
 }
+/* Fills the window (minus the backdrop's 20px padding) instead of capping at 860px. */
+.modal.wide {
+  max-width: none;
+  min-width: 0; /* else a long unbroken line in a descendant <pre> forces this wider */
+}
 .toggle { cursor: pointer; }
 
 .pill-row { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -182,3 +192,6 @@ pre {
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 720px) { .split { grid-template-columns: 1fr; } .sidebar { width: 60px; } .sidebar h1, .sidebar .rev, .nav button span { display: none; } }
+/* Wraps columns based on the modal's own available width instead of a viewport breakpoint. */
+.split.wrap { grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
+.split.wrap > div { min-width: 0; }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api.ts';
 import { useToast } from '../toast.tsx';
 import { detectBrowserTimeZone, getStoredTimeZone, listSupportedTimeZones, setStoredTimeZone } from '../time.ts';
+import { JsonBlock } from '../JsonBlock.tsx';
 
 export function Settings(): JSX.Element {
   const toast = useToast();
@@ -114,11 +115,11 @@ export function Settings(): JSX.Element {
       <div className="split">
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Log retention</h3>
-          <pre>{JSON.stringify(retention, null, 2)}</pre>
+          <JsonBlock value={retention} />
         </div>
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Script sandbox</h3>
-          <pre>{JSON.stringify(status?.['scriptSandbox'] ?? {}, null, 2)}</pre>
+          <JsonBlock value={status?.['scriptSandbox'] ?? {}} />
         </div>
       </div>
     </div>

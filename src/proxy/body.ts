@@ -74,31 +74,63 @@ export function readBodyUpTo(stream: Readable, limitBytes: number): Promise<Body
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let settled = false;
+    let ended = false;
+    let endTimer: ReturnType<typeof setTimeout> | undefined;
+    const isHttp2Stream = typeof (stream as { rstCode?: unknown }).rstCode === 'number';
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const succeed = (result: BodyReadResult): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
     const onData = (chunk: Buffer): void => {
       chunks.push(chunk);
       total += chunk.byteLength;
       if (total > limitBytes) {
-        cleanup();
         stream.pause();
-        resolve({ complete: false, prefix: Buffer.concat(chunks) });
+        succeed({ complete: false, prefix: Buffer.concat(chunks) });
       }
     };
     const onEnd = (): void => {
-      cleanup();
-      resolve({ complete: true, buffer: Buffer.concat(chunks) });
+      ended = true;
+      if (!isHttp2Stream) {
+        succeed({ complete: true, buffer: Buffer.concat(chunks) });
+        return;
+      }
+      // An HTTP/2 RST_STREAM can emit `end` before `aborted`. Give the socket
+      // one event-loop tick to deliver that paired reset before accepting a
+      // complete body result; a real completed request resolves unchanged.
+      endTimer = setTimeout(() => succeed({ complete: true, buffer: Buffer.concat(chunks) }), 1);
     };
     const onError = (err: Error): void => {
-      cleanup();
-      reject(err);
+      fail(err);
+    };
+    const onAborted = (): void => {
+      fail(new Error('client stream aborted before request body completed'));
+    };
+    const onClose = (): void => {
+      if (!ended) fail(new Error('client stream closed before request body completed'));
     };
     const cleanup = (): void => {
+      if (endTimer !== undefined) clearTimeout(endTimer);
       stream.off('data', onData);
       stream.off('end', onEnd);
       stream.off('error', onError);
+      stream.off('aborted', onAborted);
+      stream.off('close', onClose);
     };
     stream.on('data', onData);
     stream.on('end', onEnd);
     stream.on('error', onError);
+    stream.on('aborted', onAborted);
+    stream.on('close', onClose);
   });
 }
 

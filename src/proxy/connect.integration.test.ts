@@ -3,6 +3,7 @@ import net from 'node:net';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { writeFileSync } from 'node:fs';
@@ -254,7 +255,7 @@ type TimeClient = grpc.Client & {
     request: { tz: string },
     metadata: grpc.Metadata,
     callback: (err: grpc.ServiceError | null, res?: NowResponse) => void,
-  ): void;
+  ): grpc.ClientUnaryCall;
 };
 
 describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
@@ -262,6 +263,8 @@ describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
   let upstreamPort: number;
   let ctor: new (a: string, c: grpc.ChannelCredentials) => TimeClient;
   let savedProxy: string | undefined;
+  /** Stashed callbacks for tz:'hang' calls, released manually by a test. */
+  const pendingNowCalls: grpc.sendUnaryData<NowResponse>[] = [];
 
   beforeAll(async () => {
     const dir = mkdtempSync(join(tmpdir(), 'morpheus-connect-grpc-'));
@@ -276,9 +279,15 @@ describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
     upstreamServer = new grpc.Server();
     upstreamServer.addService((demo['TimeService'] as grpc.ServiceClientConstructor).service, {
       Now: (
-        _call: grpc.ServerUnaryCall<{ tz: string }, NowResponse>,
+        call: grpc.ServerUnaryCall<{ tz: string }, NowResponse>,
         callback: grpc.sendUnaryData<NowResponse>,
-      ) => callback(null, { iso: '2026-06-10T00:00:00.000Z', source: 'real' }),
+      ) => {
+        if (call.request.tz === 'hang') {
+          pendingNowCalls.push(callback);
+          return;
+        }
+        callback(null, { iso: '2026-06-10T00:00:00.000Z', source: 'real' });
+      },
     });
     upstreamPort = await new Promise<number>((resolve, reject) => {
       upstreamServer.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (err, port) =>
@@ -294,6 +303,9 @@ describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
   afterEach(() => {
     if (savedProxy === undefined) delete process.env['grpc_proxy'];
     else process.env['grpc_proxy'] = savedProxy;
+    while (pendingNowCalls.length > 0) {
+      pendingNowCalls.pop()?.(null, { iso: 'unused', source: 'real' });
+    }
   });
 
   function registryWithProto(): DescriptorRegistry {
@@ -347,5 +359,45 @@ describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
     expect(faults).toHaveLength(2);
     // the CONNECT authority became the per-connection upstream target
     expect(faults[0]?.target).toBe(`h2c://127.0.0.1:${upstreamPort}`);
+  });
+
+  it('logs a client-cancelled call exactly once through the tunnel (client_aborted wiring check)', async () => {
+    // No descriptor: routes through handleStreaming exactly like the real
+    // incident, confirming the fix reaches calls made through the CONNECT
+    // dispatch (dispatchGrpc -> grpcStreamHandler), not just the reverse
+    // gRPC listener.
+    const stack = await startConnect({
+      protocol: 'grpc',
+      descriptors: new DescriptorRegistry(),
+      rules: [
+        {
+          id: 'cap-all',
+          protocol: 'grpc',
+          match: { type: 'regex', field: 'path', pattern: '^/' },
+          logging: { capture: true },
+        },
+      ],
+    });
+    cleanups.push(() => stack.close());
+
+    savedProxy = process.env['grpc_proxy'];
+    process.env['grpc_proxy'] = `http://127.0.0.1:${stack.port}`;
+
+    const client = new ctor(`127.0.0.1:${upstreamPort}`, grpc.credentials.createInsecure());
+    cleanups.push(() => client.close());
+
+    const call = client.Now({ tz: 'hang' }, new grpc.Metadata(), () => {
+      /* the client gives up long before this would ever fire */
+    });
+    while (pendingNowCalls.length === 0) await sleep(5);
+    call.cancel();
+    await sleep(50);
+    pendingNowCalls.pop()?.(null, { iso: 'too-late', source: 'real' });
+    await sleep(50);
+
+    const items = stack.trafficLog.list().items;
+    expect(items).toHaveLength(1);
+    expect(items[0]?.outcome).toBe('client_aborted');
+    expect(items[0]?.target).toBe(`h2c://127.0.0.1:${upstreamPort}`);
   });
 });
