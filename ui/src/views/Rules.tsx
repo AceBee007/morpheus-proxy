@@ -29,7 +29,7 @@ export function Rules(): JSX.Element {
   const toast = useToast();
   const [items, setItems] = useState<RuleListItem[]>([]);
   const [revision, setRevision] = useState(0);
-  const [editing, setEditing] = useState<{ rule: Rule | null } | null>(null);
+  const [editing, setEditing] = useState<{ rule: Rule | null; isNew?: boolean } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(async () => {
@@ -79,10 +79,8 @@ export function Rules(): JSX.Element {
   };
 
   const duplicate = (rule: Rule): void => {
-    const copy = { ...rule, id: `${rule.id}-copy`, name: `${rule.name} (copy)` } as Record<string, unknown>;
-    delete copy['createdAt'];
-    delete copy['updatedAt'];
-    setEditing({ rule: copy as unknown as Rule });
+    const copy = { ...rule, id: `${rule.id}-copy`, name: `${rule.name} (copy)` };
+    setEditing({ rule: copy, isNew: true });
   };
 
   const disableAll = async (): Promise<void> => {
@@ -196,6 +194,7 @@ export function Rules(): JSX.Element {
       {editing && (
         <RuleEditor
           initial={editing.rule}
+          isNew={editing.isNew}
           revision={revision}
           onClose={() => setEditing(null)}
           onSaved={() => {

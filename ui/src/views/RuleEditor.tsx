@@ -8,6 +8,8 @@ type Mode = 'simple' | 'advanced' | 'script';
 
 interface Props {
   initial?: Rule | null;
+  /** True when `initial` is only a prefill (e.g. duplicating a rule) and save should create a new rule rather than update it. */
+  isNew?: boolean;
   revision: number;
   onClose: () => void;
   onSaved: () => void;
@@ -19,8 +21,9 @@ const BLANK = {
   request: { action: { type: 'mock_response', response: { statusCode: 200, body: '{}' } } },
 };
 
-export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.Element {
+export function RuleEditor({ initial, isNew = false, revision, onClose, onSaved }: Props): JSX.Element {
   const toast = useToast();
+  const isExistingRule = initial != null && !isNew;
   const [mode, setMode] = useState<Mode>(initial ? 'advanced' : 'simple');
   const [text, setText] = useState(() =>
     JSON.stringify(initial ? stripServerFields(initial) : BLANK, null, 2),
@@ -73,13 +76,13 @@ export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.
     setSaving(true);
     try {
       const looksScript = mode === 'script' || JSON.stringify(rule).includes('"script"');
-      if (looksScript && !initial) {
+      if (looksScript && !isExistingRule) {
         if (!confirm('This rule contains a script that runs in the sandbox. Save it?')) {
           setSaving(false);
           return;
         }
       }
-      if (initial) {
+      if (initial != null && !isNew) {
         await api.updateRule(initial.id, rule, revision);
         toast('ok', `Rule ${initial.id} updated`);
       } else {
@@ -98,7 +101,9 @@ export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="row">
-          <h2 style={{ margin: 0 }}>{initial ? `Edit rule ${initial.id}` : 'New rule'}</h2>
+          <h2 style={{ margin: 0 }}>
+            {initial == null ? 'New rule' : isExistingRule ? `Edit rule ${initial.id}` : `Duplicate rule ${initial.id}`}
+          </h2>
           <div className="spacer" />
           <button className="btn ghost" onClick={onClose}>Close</button>
         </div>
@@ -125,7 +130,7 @@ export function RuleEditor({ initial, revision, onClose, onSaved }: Props): JSX.
           <button className="btn ghost" onClick={runValidate}>Validate</button>
           <button className="btn ghost" onClick={runSimulateSample}>Simulate (sample GET /users/1)</button>
           <div className="spacer" />
-          <button className="btn" disabled={saving} onClick={save}>{initial ? 'Save changes' : 'Create rule'}</button>
+          <button className="btn" disabled={saving} onClick={save}>{isExistingRule ? 'Save changes' : 'Create rule'}</button>
         </div>
 
         {validation && <JsonBlock value={validation} style={{ marginTop: 12 }} />}
