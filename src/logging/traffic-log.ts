@@ -13,9 +13,15 @@ export type Outcome =
   | 'modified'
   | 'delayed'
   | 'upstream_error'
-  | 'rule_error';
+  | 'rule_error'
+  | 'client_aborted';
 
-export type LoggingReason = 'capture_rule' | 'matched_rule' | 'upstream_error' | 'rule_error';
+export type LoggingReason =
+  | 'capture_rule'
+  | 'matched_rule'
+  | 'upstream_error'
+  | 'rule_error'
+  | 'client_aborted';
 
 export const PREVIEW_BYTES = 4096;
 

@@ -84,6 +84,8 @@ export interface HttpExchange {
   respond(status: number, headers: HeaderMap, body?: Buffer): void;
   respondStream(status: number, headers: HeaderMap, stream: Readable): void;
   destroy(reset: boolean): void;
+  /** True once the underlying connection/stream is gone (client left). */
+  isDestroyed(): boolean;
 }
 
 interface OutcomeFlags {
@@ -92,9 +94,11 @@ interface OutcomeFlags {
   modified: boolean;
   delayed: boolean;
   upstreamError: boolean;
+  clientAborted: boolean;
 }
 
 function decideOutcome(flags: OutcomeFlags, hasRuleErrors: boolean): Outcome {
+  if (flags.clientAborted) return 'client_aborted';
   if (flags.upstreamError) return 'upstream_error';
   if (flags.mock) return 'mock';
   if (flags.fault) return 'fault';
@@ -165,7 +169,60 @@ export async function handleHttpExchange(
     try {
       result = await readBodyUpTo(exchange.bodyStream, requestLimit);
     } catch {
+      // The body is incomplete, but rule ordering and consumption still apply:
+      // evaluate body-independent matchers in the same priority order as an
+      // ordinary streaming request. This makes a preceding intercept consume
+      // normally; when it is exhausted, a later capture rule is recorded.
       exchange.destroy(false);
+      const evaluation = await evaluateRequest({
+        rules: snapshot.rules,
+        protocol,
+        request: {
+          id: randomUUID(),
+          method: exchange.method,
+          host: exchange.authority,
+          path,
+          query,
+          headers: exchange.headers,
+        },
+        consume: runtime.consume,
+        ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
+        streaming: true,
+      });
+      const shouldLog =
+        evaluation.interceptRule !== null ||
+        evaluation.captureRules.length > 0 ||
+        evaluation.errors.length > 0;
+      runtime.metrics?.recordRequest(
+        shouldLog ? 'client_aborted' : 'passthrough',
+        evaluation.matched.map((m) => m.id),
+        undefined,
+      );
+      for (let i = 0; i < evaluation.errors.length; i++) runtime.metrics?.recordScriptError();
+      if (!shouldLog) return;
+      try {
+        runtime.trafficLog.add({
+          startedAt,
+          endedAt: now(),
+          protocol,
+          listener: listener.name,
+          client: exchange.client,
+          target: listener.upstream,
+          request: {
+            method: exchange.method,
+            path: exchange.rawPath,
+            headers: exchange.headers,
+            bodySkippedReason: 'client_aborted',
+          },
+          response: { headers: {}, bodySkippedReason: 'client_aborted' },
+          outcome: 'client_aborted',
+          loggingReason: 'client_aborted',
+          matchedRules: evaluation.matched,
+          ruleErrors: evaluation.errors,
+        });
+      } catch (err) {
+        runtime.appLog.error('traffic log write failed', { error: String(err) });
+      }
       return;
     }
     if (result.complete) {
@@ -212,6 +269,7 @@ export async function handleHttpExchange(
     modified: false,
     delayed: false,
     upstreamError: false,
+    clientAborted: false,
   };
   const timing: TimingInfo = {};
   const requestContentType = headerValue(exchange.headers, 'content-type');
@@ -236,8 +294,15 @@ export async function handleHttpExchange(
 
   let forwardedDraft: (MessageDraft & { modified: boolean }) | undefined;
   let upstreamDraft: (MessageDraft & { received: boolean }) | undefined;
+  let logged = false;
 
   const writeLog = (responseDraft: MessageDraft): void => {
+    logged = true;
+    // A respond()/respondStream() call just above this may have silently
+    // no-op'd because the client was already gone (spec 4.9): re-check here,
+    // not only in the catch below, so a fault/mock/modified outcome that was
+    // never actually delivered is not mislabeled as successfully applied.
+    if (exchange.isDestroyed()) flags.clientAborted = true;
     const shouldLog =
       rule !== null || captureRules.length > 0 || ruleErrors.length > 0 || flags.upstreamError;
     const outcome = decideOutcome(flags, ruleErrors.length > 0);
@@ -263,13 +328,15 @@ export async function handleHttpExchange(
       response: responseDraft,
       outcome,
       loggingReason:
-        outcome === 'upstream_error' && matchedRules.length === 0
-          ? 'upstream_error'
-          : rule !== null
-            ? 'matched_rule'
-            : ruleErrors.length > 0 && captureRules.length === 0
-              ? 'rule_error'
-              : 'capture_rule',
+        outcome === 'client_aborted'
+          ? 'client_aborted'
+          : outcome === 'upstream_error' && matchedRules.length === 0
+            ? 'upstream_error'
+            : rule !== null
+              ? 'matched_rule'
+              : ruleErrors.length > 0 && captureRules.length === 0
+                ? 'rule_error'
+                : 'capture_rule',
       matchedRules,
       ruleErrors,
       timing,
@@ -281,323 +348,351 @@ export async function handleHttpExchange(
     }
   };
 
-  const executeFault = async (fault: FaultSpec, upstreamBody?: Buffer): Promise<void> => {
-    flags.fault = true;
-    switch (fault.kind) {
-      case 'http_response': {
-        const body = Buffer.from(fault.body ?? '', 'utf8');
-        const headers = toHeaderMap(fault.headers);
-        setHeader(headers, 'content-length', String(body.byteLength));
-        exchange.respond(fault.statusCode, headers, body);
-        writeLog({
-          statusCode: fault.statusCode,
-          headers,
-          body,
-          ...(headerValue(headers, 'content-type') !== undefined
-            ? { contentType: headerValue(headers, 'content-type') as string }
-            : {}),
-        });
-        return;
-      }
-      case 'connection': {
-        writeLog({ headers: {}, bodySkippedReason: `connection_${fault.mode}` });
-        exchange.destroy(fault.mode === 'reset');
-        return;
-      }
-      case 'timeout': {
-        writeLog({ headers: {}, bodySkippedReason: 'timeout_fault' });
-        if (fault.durationMs !== undefined) {
-          await sleep(fault.durationMs);
-          exchange.destroy(false);
-        }
-        // without durationMs the connection is left hanging (spec 4.5.2)
-        return;
-      }
-      case 'grpc_status':
-        // unreachable on http listeners (validation enforces protocol match)
-        exchange.destroy(false);
-        return;
-    }
-    void upstreamBody;
-  };
-
-  // ---- request stage (spec 4.3.2)
-  let forwardPath = path;
-  let forwardQuery = query;
-  let forwardHeaders: HeaderMap = { ...exchange.headers };
-  let forwardBody: Buffer | undefined = requestBody;
-
-  if (rule?.request) {
-    if (rule.request.delay) {
-      const plan = await applyDelay(rule.request.delay, 0);
-      flags.delayed = true;
-      timing.delayMs = plan.waitMs;
-    }
-    const action = rule.request.action;
-    if (action) {
-      if (action.type === 'mock_response') {
-        flags.mock = true;
-        const statusCode = action.response.statusCode ?? 200;
-        const body = Buffer.from(action.response.body ?? '', 'utf8');
-        const headers = toHeaderMap(action.response.headers);
-        setHeader(headers, 'content-length', String(body.byteLength));
-        exchange.respond(statusCode, headers, body);
-        writeLog({
-          statusCode,
-          headers,
-          body,
-          ...(headerValue(headers, 'content-type') !== undefined
-            ? { contentType: headerValue(headers, 'content-type') as string }
-            : {}),
-        });
-        return;
-      }
-      if (action.type === 'fault') {
-        await executeFault(action.fault);
-        return;
-      }
-      // request_rewrite
-      const rewritable = {
-        path: forwardPath,
-        query: forwardQuery,
-        headers: forwardHeaders,
-        ...(forwardBody !== undefined ? { body: forwardBody } : {}),
-      };
-      const result = applyRewriteOperations(rewritable, action.operations);
-      forwardPath = rewritable.path;
-      forwardQuery = rewritable.query;
-      forwardHeaders = rewritable.headers;
-      forwardBody = rewritable.body ?? forwardBody;
-      if (result.modified) {
-        flags.modified = true;
-        forwardedDraft = {
-          modified: true,
-          method: exchange.method,
-          path: joinPath(forwardPath, forwardQuery),
-          headers: forwardHeaders,
-          ...(result.bodyModified && forwardBody !== undefined ? { body: forwardBody } : {}),
-          ...(requestContentType !== undefined ? { contentType: requestContentType } : {}),
-        };
-      }
-    }
-  }
-
-  // ---- forward to upstream
-  const target = parseUpstream(listener.upstream);
-  const upstreamStartMs = Date.now();
-  let reply: UpstreamReply;
+  // Everything below has a rule/capture in play (persistNeeded/writeLog are
+  // meaningful), so guarantee exactly one writeLog call no matter how this
+  // ends: every existing branch already calls it as its last step before
+  // returning, so a catch-only guard (no finally) cannot double-log.
   try {
-    reply = await sendToUpstream(target, {
-      method: exchange.method,
-      path: joinPath(forwardPath, forwardQuery),
-      authority: exchange.authority,
-      headers: stripHopByHop(forwardHeaders),
-      ...(forwardBody !== undefined
-        ? { body: forwardBody }
-        : requestTail !== undefined
-          ? { body: requestTail }
-          : requestBody === undefined
-            ? { body: exchange.bodyStream }
-            : {}),
-      timeoutMs: runtime.limits.upstreamTimeoutMs,
-    });
-  } catch (err) {
-    const reason = err instanceof UpstreamError ? err.reason : 'reset';
-    const message = err instanceof Error ? err.message : String(err);
-    flags.upstreamError = true;
-    upstreamDraft = { received: false, headers: {} };
-    const status = reason === 'timeout' ? 504 : 502;
-    const body = Buffer.from(JSON.stringify({ error: `upstream_${reason}`, message }), 'utf8');
-    const headers: HeaderMap = {
-      'content-type': 'application/json',
-      'x-morpheus-error': `upstream_${reason}`,
-      'content-length': String(body.byteLength),
-    };
-    exchange.respond(status, headers, body);
-    writeLog({ statusCode: status, headers, body, contentType: 'application/json' });
-    return;
-  }
-  timing.upstreamDurationMs = Date.now() - upstreamStartMs;
-
-  // ---- response body buffering decision
-  let responseStatus = reply.statusCode;
-  const responseHeaders = stripHopByHop(reply.headers);
-  const respInterest = responseBodyInterest(rule, captureRules);
-  const responseLimit = listener.maxResponseBodyBufferBytes;
-  const respContentLength = contentLengthOf(reply.headers);
-  const respContentType = headerValue(reply.headers, 'content-type');
-  const eventStream = respContentType?.startsWith('text/event-stream') === true;
-  let responseBody: Buffer | undefined;
-  let responseBodySkipReason: string | undefined;
-  let responseTail: Readable | undefined;
-
-  if ((respInterest.want || respInterest.need) && !eventStream) {
-    if (respContentLength !== undefined && respContentLength > responseLimit) {
-      responseBodySkipReason = 'limit_exceeded';
-    } else {
-      let result: BodyReadResult;
-      try {
-        result = await readBodyUpTo(reply.stream, responseLimit);
-      } catch (err) {
-        flags.upstreamError = true;
-        upstreamDraft = { received: true, headers: reply.headers };
-        const message = err instanceof Error ? err.message : String(err);
-        const body = Buffer.from(JSON.stringify({ error: 'upstream_reset', message }), 'utf8');
-        const headers: HeaderMap = {
-          'content-type': 'application/json',
-          'x-morpheus-error': 'upstream_reset',
-          'content-length': String(body.byteLength),
-        };
-        exchange.respond(502, headers, body);
-        writeLog({ statusCode: 502, headers, body, contentType: 'application/json' });
-        return;
+    const executeFault = async (fault: FaultSpec, upstreamBody?: Buffer): Promise<void> => {
+      flags.fault = true;
+      switch (fault.kind) {
+        case 'http_response': {
+          const body = Buffer.from(fault.body ?? '', 'utf8');
+          const headers = toHeaderMap(fault.headers);
+          setHeader(headers, 'content-length', String(body.byteLength));
+          exchange.respond(fault.statusCode, headers, body);
+          writeLog({
+            statusCode: fault.statusCode,
+            headers,
+            body,
+            ...(headerValue(headers, 'content-type') !== undefined
+              ? { contentType: headerValue(headers, 'content-type') as string }
+              : {}),
+          });
+          return;
+        }
+        case 'connection': {
+          writeLog({ headers: {}, bodySkippedReason: `connection_${fault.mode}` });
+          exchange.destroy(fault.mode === 'reset');
+          return;
+        }
+        case 'timeout': {
+          writeLog({ headers: {}, bodySkippedReason: 'timeout_fault' });
+          if (fault.durationMs !== undefined) {
+            await sleep(fault.durationMs);
+            exchange.destroy(false);
+          }
+          // without durationMs the connection is left hanging (spec 4.5.2)
+          return;
+        }
+        case 'grpc_status':
+          // unreachable on http listeners (validation enforces protocol match)
+          exchange.destroy(false);
+          return;
       }
-      if (result.complete) {
-        responseBody = result.buffer;
-      } else {
-        responseBodySkipReason = 'limit_exceeded';
-        responseTail = concatStream(result.prefix, reply.stream);
-      }
-    }
-  } else if (respInterest.want && eventStream) {
-    responseBodySkipReason = 'streaming';
-  }
-  if (responseBodySkipReason !== undefined && respInterest.need) {
-    runtime.appLog.warn('response manipulation skipped: body not buffered', {
-      rule: rule?.id,
-      path: exchange.rawPath,
-      reason: responseBodySkipReason,
-    });
-  }
-
-  const responseContentType = headerValue(reply.headers, 'content-type');
-  const upstreamBodySnapshot = responseBody;
-
-  // ---- response stage (spec 4.3.2)
-  let responseChanged = false;
-  if (rule?.response) {
-    const responseSnapshot: ResponseSnapshot = {
-      statusCode: responseStatus,
-      headers: responseHeaders,
-      ...(responseBody !== undefined
-        ? { body: responseBody.toString('utf8'), rawBodyBase64: responseBody.toString('base64') }
-        : {}),
+      void upstreamBody;
     };
-    const matchResult = await evaluateResponseMatch({
-      rule,
-      protocol,
-      request: requestSnapshot,
-      response: responseSnapshot,
-      consume: runtime.consume,
-      ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
-    });
-    if (matchResult.error !== undefined) {
-      ruleErrors.push({ ruleId: rule.id, stage: 'response', error: matchResult.error });
-    }
-    if (matchResult.matched) {
-      if (rule.response.delay) {
-        const elapsed = Date.now() - startedAt.getTime();
-        const plan = await applyDelay(rule.response.delay, elapsed);
+
+    // ---- request stage (spec 4.3.2)
+    let forwardPath = path;
+    let forwardQuery = query;
+    let forwardHeaders: HeaderMap = { ...exchange.headers };
+    let forwardBody: Buffer | undefined = requestBody;
+
+    if (rule?.request) {
+      if (rule.request.delay) {
+        const plan = await applyDelay(rule.request.delay, 0);
         flags.delayed = true;
         timing.delayMs = plan.waitMs;
-        if (rule.response.delay.mode === 'total') timing.delaySkipped = plan.skipped;
       }
-      const action = rule.response.action;
+      const action = rule.request.action;
       if (action) {
+        if (action.type === 'mock_response') {
+          flags.mock = true;
+          const statusCode = action.response.statusCode ?? 200;
+          const body = Buffer.from(action.response.body ?? '', 'utf8');
+          const headers = toHeaderMap(action.response.headers);
+          setHeader(headers, 'content-length', String(body.byteLength));
+          exchange.respond(statusCode, headers, body);
+          writeLog({
+            statusCode,
+            headers,
+            body,
+            ...(headerValue(headers, 'content-type') !== undefined
+              ? { contentType: headerValue(headers, 'content-type') as string }
+              : {}),
+          });
+          return;
+        }
         if (action.type === 'fault') {
-          if (responseBody === undefined) reply.stream.destroy();
-          upstreamDraft = {
-            received: true,
-            statusCode: reply.statusCode,
-            headers: reply.headers,
-            ...(upstreamBodySnapshot !== undefined ? { body: upstreamBodySnapshot } : {}),
-            ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
-          };
           await executeFault(action.fault);
           return;
         }
-        if (action.type === 'response_replace') {
-          if (applyResponseReplace(responseHeaders, action)) {
-            responseChanged = true;
-            flags.modified = true;
+        // request_rewrite
+        const rewritable = {
+          path: forwardPath,
+          query: forwardQuery,
+          headers: forwardHeaders,
+          ...(forwardBody !== undefined ? { body: forwardBody } : {}),
+        };
+        const result = applyRewriteOperations(rewritable, action.operations);
+        forwardPath = rewritable.path;
+        forwardQuery = rewritable.query;
+        forwardHeaders = rewritable.headers;
+        forwardBody = rewritable.body ?? forwardBody;
+        if (result.modified) {
+          flags.modified = true;
+          forwardedDraft = {
+            modified: true,
+            method: exchange.method,
+            path: joinPath(forwardPath, forwardQuery),
+            headers: forwardHeaders,
+            ...(result.bodyModified && forwardBody !== undefined ? { body: forwardBody } : {}),
+            ...(requestContentType !== undefined ? { contentType: requestContentType } : {}),
+          };
+        }
+      }
+    }
+
+    // ---- forward to upstream
+    const target = parseUpstream(listener.upstream);
+    const upstreamStartMs = Date.now();
+    let reply: UpstreamReply;
+    try {
+      reply = await sendToUpstream(target, {
+        method: exchange.method,
+        path: joinPath(forwardPath, forwardQuery),
+        authority: exchange.authority,
+        headers: stripHopByHop(forwardHeaders),
+        ...(forwardBody !== undefined
+          ? { body: forwardBody }
+          : requestTail !== undefined
+            ? { body: requestTail }
+            : requestBody === undefined
+              ? { body: exchange.bodyStream }
+              : {}),
+        timeoutMs: runtime.limits.upstreamTimeoutMs,
+      });
+    } catch (err) {
+      const reason = err instanceof UpstreamError ? err.reason : 'reset';
+      const message = err instanceof Error ? err.message : String(err);
+      flags.upstreamError = true;
+      upstreamDraft = { received: false, headers: {} };
+      const status = reason === 'timeout' ? 504 : 502;
+      const body = Buffer.from(JSON.stringify({ error: `upstream_${reason}`, message }), 'utf8');
+      const headers: HeaderMap = {
+        'content-type': 'application/json',
+        'x-morpheus-error': `upstream_${reason}`,
+        'content-length': String(body.byteLength),
+      };
+      exchange.respond(status, headers, body);
+      writeLog({ statusCode: status, headers, body, contentType: 'application/json' });
+      return;
+    }
+    timing.upstreamDurationMs = Date.now() - upstreamStartMs;
+
+    // ---- response body buffering decision
+    let responseStatus = reply.statusCode;
+    const responseHeaders = stripHopByHop(reply.headers);
+    const respInterest = responseBodyInterest(rule, captureRules);
+    const responseLimit = listener.maxResponseBodyBufferBytes;
+    const respContentLength = contentLengthOf(reply.headers);
+    const respContentType = headerValue(reply.headers, 'content-type');
+    const eventStream = respContentType?.startsWith('text/event-stream') === true;
+    let responseBody: Buffer | undefined;
+    let responseBodySkipReason: string | undefined;
+    let responseTail: Readable | undefined;
+
+    if ((respInterest.want || respInterest.need) && !eventStream) {
+      if (respContentLength !== undefined && respContentLength > responseLimit) {
+        responseBodySkipReason = 'limit_exceeded';
+      } else {
+        let result: BodyReadResult;
+        try {
+          result = await readBodyUpTo(reply.stream, responseLimit);
+        } catch (err) {
+          flags.upstreamError = true;
+          upstreamDraft = { received: true, headers: reply.headers };
+          const message = err instanceof Error ? err.message : String(err);
+          const body = Buffer.from(JSON.stringify({ error: 'upstream_reset', message }), 'utf8');
+          const headers: HeaderMap = {
+            'content-type': 'application/json',
+            'x-morpheus-error': 'upstream_reset',
+            'content-length': String(body.byteLength),
+          };
+          exchange.respond(502, headers, body);
+          writeLog({ statusCode: 502, headers, body, contentType: 'application/json' });
+          return;
+        }
+        if (result.complete) {
+          responseBody = result.buffer;
+        } else {
+          responseBodySkipReason = 'limit_exceeded';
+          responseTail = concatStream(result.prefix, reply.stream);
+        }
+      }
+    } else if (respInterest.want && eventStream) {
+      responseBodySkipReason = 'streaming';
+    }
+    if (responseBodySkipReason !== undefined && respInterest.need) {
+      runtime.appLog.warn('response manipulation skipped: body not buffered', {
+        rule: rule?.id,
+        path: exchange.rawPath,
+        reason: responseBodySkipReason,
+      });
+    }
+
+    const responseContentType = headerValue(reply.headers, 'content-type');
+    const upstreamBodySnapshot = responseBody;
+
+    // ---- response stage (spec 4.3.2)
+    let responseChanged = false;
+    if (rule?.response) {
+      const responseSnapshot: ResponseSnapshot = {
+        statusCode: responseStatus,
+        headers: responseHeaders,
+        ...(responseBody !== undefined
+          ? { body: responseBody.toString('utf8'), rawBodyBase64: responseBody.toString('base64') }
+          : {}),
+      };
+      const matchResult = await evaluateResponseMatch({
+        rule,
+        protocol,
+        request: requestSnapshot,
+        response: responseSnapshot,
+        consume: runtime.consume,
+        ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
+      });
+      if (matchResult.error !== undefined) {
+        ruleErrors.push({ ruleId: rule.id, stage: 'response', error: matchResult.error });
+      }
+      if (matchResult.matched) {
+        if (rule.response.delay) {
+          const elapsed = Date.now() - startedAt.getTime();
+          const plan = await applyDelay(rule.response.delay, elapsed);
+          flags.delayed = true;
+          timing.delayMs = plan.waitMs;
+          if (rule.response.delay.mode === 'total') timing.delaySkipped = plan.skipped;
+        }
+        const action = rule.response.action;
+        if (action) {
+          if (action.type === 'fault') {
+            if (responseBody === undefined) reply.stream.destroy();
+            upstreamDraft = {
+              received: true,
+              statusCode: reply.statusCode,
+              headers: reply.headers,
+              ...(upstreamBodySnapshot !== undefined ? { body: upstreamBodySnapshot } : {}),
+              ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
+            };
+            await executeFault(action.fault);
+            return;
           }
-        } else if (action.type === 'script_manipulator') {
-          if (responseBody === undefined && responseBodySkipReason !== undefined) {
-            // buffered body unavailable: passthrough (spec 4.8.3), warned above
-          } else if (!runtime.manipulatorRunner) {
-            ruleErrors.push({
-              ruleId: rule.id,
-              stage: 'response',
-              error: 'script manipulator requires the script sandbox, which is not available',
-            });
-          } else {
-            try {
-              const patch = await runtime.manipulatorRunner(action, {
-                protocol,
+          if (action.type === 'response_replace') {
+            if (applyResponseReplace(responseHeaders, action)) {
+              responseChanged = true;
+              flags.modified = true;
+            }
+          } else if (action.type === 'script_manipulator') {
+            if (responseBody === undefined && responseBodySkipReason !== undefined) {
+              // buffered body unavailable: passthrough (spec 4.8.3), warned above
+            } else if (!runtime.manipulatorRunner) {
+              ruleErrors.push({
+                ruleId: rule.id,
                 stage: 'response',
-                request: requestSnapshot,
-                response: responseSnapshot,
-                ruleState: runtime.consume.view(rule),
-                upstream: { durationMs: timing.upstreamDurationMs ?? 0 },
+                error: 'script manipulator requires the script sandbox, which is not available',
               });
-              const patchable = {
-                statusCode: responseStatus,
-                headers: responseHeaders,
-                ...(responseBody !== undefined ? { body: responseBody } : {}),
-              };
-              const outcome = applyHttpResponsePatch(patchable, patch);
-              responseStatus = patchable.statusCode;
-              if (outcome.bodyChanged) responseBody = patchable.body;
-              if (outcome.ignoredFields.length > 0) {
-                runtime.appLog.warn('script patch fields ignored for http response', {
-                  rule: rule.id,
-                  fields: outcome.ignoredFields,
+            } else {
+              try {
+                const patch = await runtime.manipulatorRunner(action, {
+                  protocol,
+                  stage: 'response',
+                  request: requestSnapshot,
+                  response: responseSnapshot,
+                  ruleState: runtime.consume.view(rule),
+                  upstream: { durationMs: timing.upstreamDurationMs ?? 0 },
                 });
+                const patchable = {
+                  statusCode: responseStatus,
+                  headers: responseHeaders,
+                  ...(responseBody !== undefined ? { body: responseBody } : {}),
+                };
+                const outcome = applyHttpResponsePatch(patchable, patch);
+                responseStatus = patchable.statusCode;
+                if (outcome.bodyChanged) responseBody = patchable.body;
+                if (outcome.ignoredFields.length > 0) {
+                  runtime.appLog.warn('script patch fields ignored for http response', {
+                    rule: rule.id,
+                    fields: outcome.ignoredFields,
+                  });
+                }
+                if (outcome.changed) {
+                  responseChanged = true;
+                  flags.modified = true;
+                }
+              } catch (err) {
+                const message =
+                  err instanceof InvalidPatchError || err instanceof Error
+                    ? err.message
+                    : String(err);
+                ruleErrors.push({ ruleId: rule.id, stage: 'response', error: message });
               }
-              if (outcome.changed) {
-                responseChanged = true;
-                flags.modified = true;
-              }
-            } catch (err) {
-              const message =
-                err instanceof InvalidPatchError || err instanceof Error
-                  ? err.message
-                  : String(err);
-              ruleErrors.push({ ruleId: rule.id, stage: 'response', error: message });
             }
           }
         }
       }
     }
-  }
 
-  if (responseChanged) {
-    upstreamDraft = {
-      received: true,
-      statusCode: reply.statusCode,
-      headers: reply.headers,
-      ...(upstreamBodySnapshot !== undefined ? { body: upstreamBodySnapshot } : {}),
-      ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
-    };
-  }
-
-  // ---- send the response to the client
-  if (responseBody !== undefined) {
     if (responseChanged) {
-      setHeader(responseHeaders, 'content-length', String(responseBody.byteLength));
+      upstreamDraft = {
+        received: true,
+        statusCode: reply.statusCode,
+        headers: reply.headers,
+        ...(upstreamBodySnapshot !== undefined ? { body: upstreamBodySnapshot } : {}),
+        ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
+      };
     }
-    exchange.respond(responseStatus, responseHeaders, responseBody);
-  } else {
-    exchange.respondStream(responseStatus, responseHeaders, responseTail ?? reply.stream);
-  }
 
-  writeLog({
-    statusCode: responseStatus,
-    headers: responseHeaders,
-    ...(persistNeeded() && responseBody !== undefined ? { body: responseBody } : {}),
-    ...(persistNeeded() && responseBodySkipReason !== undefined
-      ? { bodySkippedReason: responseBodySkipReason }
-      : {}),
-    ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
-  });
+    // ---- send the response to the client
+    if (responseBody !== undefined) {
+      if (responseChanged) {
+        setHeader(responseHeaders, 'content-length', String(responseBody.byteLength));
+      }
+      exchange.respond(responseStatus, responseHeaders, responseBody);
+    } else {
+      exchange.respondStream(responseStatus, responseHeaders, responseTail ?? reply.stream);
+    }
+
+    writeLog({
+      statusCode: responseStatus,
+      headers: responseHeaders,
+      ...(persistNeeded() && responseBody !== undefined ? { body: responseBody } : {}),
+      ...(persistNeeded() && responseBodySkipReason !== undefined
+        ? { bodySkippedReason: responseBodySkipReason }
+        : {}),
+      ...(responseContentType !== undefined ? { contentType: responseContentType } : {}),
+    });
+  } catch (err) {
+    if (logged) throw err;
+    if (exchange.isDestroyed()) {
+      flags.clientAborted = true;
+      writeLog({ headers: {}, bodySkippedReason: 'client_aborted' });
+    } else {
+      // exchange.respond() no-ops if a response was already sent, so this is
+      // always safe to call even if the throw happened after the client's
+      // real response went out (e.g. inside a script manipulator).
+      ruleErrors.push({
+        ruleId: rule?.id ?? 'unknown',
+        stage: 'response',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      const body = Buffer.from(JSON.stringify({ error: 'proxy_internal_error' }), 'utf8');
+      const headers: HeaderMap = {
+        'content-type': 'application/json',
+        'content-length': String(body.byteLength),
+      };
+      exchange.respond(500, headers, body);
+      writeLog({ statusCode: 500, headers, body, contentType: 'application/json' });
+    }
+  }
 }

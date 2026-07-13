@@ -149,7 +149,14 @@ interface LogAccumulator {
   ruleErrors: RuleErrorInfo[];
   captureRules: Rule[];
   rule: Rule | null;
-  flags: { mock: boolean; fault: boolean; modified: boolean; delayed: boolean; upstreamError: boolean };
+  flags: {
+    mock: boolean;
+    fault: boolean;
+    modified: boolean;
+    delayed: boolean;
+    upstreamError: boolean;
+    clientAborted: boolean;
+  };
   timing: TimingInfo;
   forwardedDraft?: MessageDraft & { modified: boolean };
   upstreamDraft?: MessageDraft & { received: boolean };
@@ -167,19 +174,21 @@ function makeWriteLog(
       acc.captureRules.length > 0 ||
       acc.ruleErrors.length > 0 ||
       acc.flags.upstreamError;
-    const outcome = acc.flags.upstreamError
-      ? 'upstream_error'
-      : acc.flags.mock
-        ? 'mock'
-        : acc.flags.fault
-          ? 'fault'
-          : acc.flags.modified
-            ? 'modified'
-            : acc.flags.delayed
-              ? 'delayed'
-              : acc.ruleErrors.length > 0
-                ? 'rule_error'
-                : 'captured';
+    const outcome = acc.flags.clientAborted
+      ? 'client_aborted'
+      : acc.flags.upstreamError
+        ? 'upstream_error'
+        : acc.flags.mock
+          ? 'mock'
+          : acc.flags.fault
+            ? 'fault'
+            : acc.flags.modified
+              ? 'modified'
+              : acc.flags.delayed
+                ? 'delayed'
+                : acc.ruleErrors.length > 0
+                  ? 'rule_error'
+                  : 'captured';
     runtime.metrics?.recordRequest(
       shouldLog ? outcome : 'passthrough',
       acc.matched.map((m) => m.id),
@@ -200,13 +209,15 @@ function makeWriteLog(
       response: responseDraft,
       outcome,
       loggingReason:
-        outcome === 'upstream_error' && acc.matched.length === 0
-          ? 'upstream_error'
-          : acc.rule !== null
-            ? 'matched_rule'
-            : acc.ruleErrors.length > 0 && acc.captureRules.length === 0
-              ? 'rule_error'
-              : 'capture_rule',
+        outcome === 'client_aborted'
+          ? 'client_aborted'
+          : outcome === 'upstream_error' && acc.matched.length === 0
+            ? 'upstream_error'
+            : acc.rule !== null
+              ? 'matched_rule'
+              : acc.ruleErrors.length > 0 && acc.captureRules.length === 0
+                ? 'rule_error'
+                : 'capture_rule',
       matchedRules: acc.matched,
       ruleErrors: acc.ruleErrors,
       timing: acc.timing,
@@ -234,10 +245,64 @@ async function handleUnary(
 ): Promise<void> {
   const { stream, path, metadata } = ctx;
   const limit = runtime.listener.maxRequestBodyBufferBytes;
+  const grpcPath = parseGrpcPath(path);
 
   const read = await readBodyUpTo(stream as unknown as Readable, limit).catch(() => null);
   if (read === null) {
+    // The body is incomplete, but rule ordering and consumption still apply:
+    // body-independent matchers are evaluated exactly as for any streaming
+    // request, so an exhausted intercept falls through to a later capture.
     stream.destroy();
+    const snapshot = runtime.ruleStore.snapshot();
+    const evaluation = await evaluateRequest({
+      rules: snapshot.rules,
+      protocol: 'grpc',
+      request: {
+        id: randomUUID(),
+        method: 'POST',
+        host: ctx.authority,
+        path,
+        query: '',
+        headers: metadata,
+        grpc: {
+          ...(grpcPath.service !== undefined ? { service: grpcPath.service } : {}),
+          ...(grpcPath.method !== undefined ? { method: grpcPath.method } : {}),
+          metadata,
+        },
+      },
+      consume: runtime.consume,
+      ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
+      streaming: true,
+    });
+    const shouldLog =
+      evaluation.interceptRule !== null ||
+      evaluation.captureRules.length > 0 ||
+      evaluation.errors.length > 0;
+    runtime.metrics?.recordRequest(
+      shouldLog ? 'client_aborted' : 'passthrough',
+      evaluation.matched.map((m) => m.id),
+      undefined,
+    );
+    for (let i = 0; i < evaluation.errors.length; i++) runtime.metrics?.recordScriptError();
+    if (!shouldLog) return;
+    try {
+      runtime.trafficLog.add({
+        startedAt: ctx.startedAt,
+        endedAt: (runtime.now ?? (() => new Date()))(),
+        protocol: 'grpc',
+        listener: runtime.listener.name,
+        client: ctx.client,
+        target: runtime.listener.upstream,
+        request: { method: 'POST', path, headers: metadata, bodySkippedReason: 'client_aborted' },
+        response: { headers: {}, bodySkippedReason: 'client_aborted' },
+        outcome: 'client_aborted',
+        loggingReason: 'client_aborted',
+        matchedRules: evaluation.matched,
+        ruleErrors: evaluation.errors,
+      });
+    } catch (err) {
+      runtime.appLog.error('traffic log write failed', { error: String(err) });
+    }
     return;
   }
   if (!read.complete) {
@@ -265,7 +330,6 @@ async function handleUnary(
     });
   }
 
-  const grpcPath = parseGrpcPath(path);
   const requestSnapshot: RequestSnapshot = {
     id: randomUUID(),
     method: 'POST',
@@ -299,7 +363,14 @@ async function handleUnary(
     ruleErrors: [...evaluation.errors],
     captureRules: evaluation.captureRules,
     rule: evaluation.interceptRule,
-    flags: { mock: false, fault: false, modified: false, delayed: false, upstreamError: false },
+    flags: {
+      mock: false,
+      fault: false,
+      modified: false,
+      delayed: false,
+      upstreamError: false,
+      clientAborted: false,
+    },
     timing: {},
   };
   const rule = acc.rule;
@@ -321,8 +392,48 @@ async function handleUnary(
       ? { body: requestLogBody, contentType: 'application/json' }
       : {}),
   });
-  const writeLog = makeWriteLog(runtime, ctx, acc, requestDraft);
+  const rawWriteLog = makeWriteLog(runtime, ctx, acc, requestDraft);
+  let logged = false;
+  const writeLog = (draft: MessageDraft): void => {
+    logged = true;
+    // respondGrpc()/stream.respond() just above this may have silently
+    // no-op'd because the client was already gone (spec 4.9): re-check here,
+    // not only in the catch below, so a fault/mock/modified outcome that was
+    // never actually delivered is not mislabeled as successfully applied.
+    if (stream.destroyed) acc.flags.clientAborted = true;
+    rawWriteLog(draft);
+  };
 
+  // Guarantee exactly one writeLog call for this attempt, including when the
+  // client is already gone by the time we try to respond (spec 4.9 — every
+  // attempt a rule engaged with must leave exactly one trace). Every existing
+  // branch below already calls writeLog as its last step before returning,
+  // so a catch-only guard (no finally) cannot double-log.
+  try {
+    await handleUnaryBody();
+  } catch (err) {
+    if (logged) throw err;
+    // `stream.destroyed` alone: `.aborted` is set for any abnormal destroy,
+    // including a self-inflicted one, and nothing here destroys the client
+    // stream before this catch could run, so `.destroyed` is unambiguous.
+    if (stream.destroyed) {
+      acc.flags.clientAborted = true;
+      writeLog({ headers: {}, bodySkippedReason: 'client_aborted' });
+    } else {
+      acc.ruleErrors.push({
+        ruleId: rule?.id ?? 'unknown',
+        stage: 'response',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      respondGrpc(stream, {
+        grpcStatus: GRPC_STATUS.INTERNAL,
+        grpcMessage: 'morpheus-proxy: internal error',
+      });
+      writeLog({ statusCode: 200, grpcStatus: GRPC_STATUS.INTERNAL, headers: {} });
+    }
+  }
+
+  async function handleUnaryBody(): Promise<void> {
   // ---- request stage
   let forwardMetadata: HeaderMap = { ...metadata };
   if (rule?.request) {
@@ -689,6 +800,7 @@ async function handleUnary(
       ? { body: finalLogBody, contentType: 'application/json' }
       : {}),
   });
+  }
 }
 
 async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promise<void> {
@@ -723,7 +835,14 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
     ruleErrors: [...evaluation.errors],
     captureRules: evaluation.captureRules,
     rule: evaluation.interceptRule,
-    flags: { mock: false, fault: false, modified: false, delayed: false, upstreamError: false },
+    flags: {
+      mock: false,
+      fault: false,
+      modified: false,
+      delayed: false,
+      upstreamError: false,
+      clientAborted: false,
+    },
     timing: {},
   };
   const rule = acc.rule;
@@ -733,8 +852,63 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
     headers: metadata,
     bodySkippedReason: 'streaming',
   });
-  const writeLog = makeWriteLog(runtime, ctx, acc, requestDraft);
+  const rawWriteLog = makeWriteLog(runtime, ctx, acc, requestDraft);
+  let logged = false;
+  // Set by the relay's upstream-error handler inside handleStreamingBody
+  // when IT destroys `stream` itself (reacting to the upstream failing) —
+  // distinguishes that from the client destroying it, since `stream.destroyed`
+  // alone is true for both (see the 'Tracked explicitly' comment below).
+  let selfDestroyed = false;
+  const writeLog = (draft: MessageDraft): void => {
+    logged = true;
+    // respondGrpc()/stream.respond() just above this may have silently
+    // no-op'd because the client was already gone (spec 4.9): re-check here,
+    // not only in the catch below, so a fault/mock/modified outcome that was
+    // never actually delivered is not mislabeled as successfully applied.
+    if (stream.destroyed && !selfDestroyed) acc.flags.clientAborted = true;
+    rawWriteLog(draft);
+  };
 
+  // Set by handleStreamingBody once the upstream responds, so the outer
+  // catch below can drain it on a header-stage throw. A plain Readable
+  // reference (not `reply` itself) because TypeScript can't narrow a
+  // `UpstreamReply | undefined` outer variable across the closure boundary.
+  let upstreamReplyStream: Readable | undefined;
+
+  // Guarantee exactly one writeLog call for this attempt no matter how the
+  // relay ends, including when the client is already gone by the time we
+  // try to talk to it (spec 4.9 — every attempt a rule engaged with must
+  // leave exactly one trace). Three guards, not a single try/finally:
+  // guard 1 covers the synchronous setup below; guard 2 covers the detached
+  // async tail that runs once the upstream response ends; guard 3 covers a
+  // client cancelling mid-relay, which ends neither via a throw nor via the
+  // upstream's 'end' event.
+  try {
+    await handleStreamingBody();
+  } catch (err) {
+    upstreamReplyStream?.destroy();
+    if (logged) throw err;
+    // `stream.destroyed` alone: nothing destroys the client stream itself
+    // before this catch could run (the upstream-error self-destroy handler
+    // below is wired up only after this point), so it's unambiguous here.
+    if (stream.destroyed) {
+      acc.flags.clientAborted = true;
+      writeLog({ headers: {}, bodySkippedReason: 'client_aborted' });
+    } else {
+      acc.ruleErrors.push({
+        ruleId: rule?.id ?? 'unknown',
+        stage: 'response',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      respondGrpc(stream, {
+        grpcStatus: GRPC_STATUS.INTERNAL,
+        grpcMessage: 'morpheus-proxy: internal error',
+      });
+      writeLog({ statusCode: 200, grpcStatus: GRPC_STATUS.INTERNAL, headers: {} });
+    }
+  }
+
+  async function handleStreamingBody(): Promise<void> {
   // ---- request stage (metadata-level only, spec 4.7.5)
   let forwardMetadata: HeaderMap = { ...metadata };
   if (rule?.request) {
@@ -801,6 +975,7 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
         timeoutMs: runtime.limits.upstreamTimeoutMs,
       },
     );
+    upstreamReplyStream = reply.stream;
   } catch (err) {
     acc.flags.upstreamError = true;
     acc.upstreamDraft = { received: false, headers: {} };
@@ -895,12 +1070,14 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
 
   // relay headers, pipe body, then rewrite trailers on arrival (spec 4.7.5)
   let pendingTrailers: http2.OutgoingHttpHeaders = {};
-  try {
-    stream.respond({ ':status': 200, ...metadataToOutgoing(outHeaders), 'content-type': headerValue(reply.headers, 'content-type') ?? 'application/grpc' }, { waitForTrailers: true });
-  } catch {
-    stream.destroy();
-    return;
-  }
+  stream.respond(
+    {
+      ':status': 200,
+      ...metadataToOutgoing(outHeaders),
+      'content-type': headerValue(reply.headers, 'content-type') ?? 'application/grpc',
+    },
+    { waitForTrailers: true },
+  );
   stream.once('wantTrailers', () => {
     try {
       stream.sendTrailers(pendingTrailers);
@@ -909,12 +1086,40 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
     }
   });
 
+  // `selfDestroyed` (declared in the outer scope) is set here rather than
+  // read off `stream.aborted`: Node sets that flag for ANY abnormal destroy
+  // of a stream whose writable side hasn't ended, including our own
+  // destroy() below — not only a peer-initiated one.
   reply.stream.pipe(stream, { end: false });
-  reply.stream.on('error', () => stream.destroy());
-  stream.on('close', () => reply.stream.destroy());
+  reply.stream.on('error', () => {
+    selfDestroyed = true;
+    stream.destroy();
+  });
+  stream.on('close', () => {
+    reply.stream.destroy();
+    // The client cancelling mid-relay ends here, not via reply.stream's
+    // 'end' event (destroying it below never fires 'end'), so this is the
+    // only place left to log that attempt if nothing has logged it yet.
+    if (logged) return;
+    if (!selfDestroyed) {
+      acc.flags.clientAborted = true;
+      writeLog({ headers: {}, bodySkippedReason: 'client_aborted' });
+    } else {
+      // not a peer-initiated abort: we destroyed our own stream, e.g.
+      // reacting to the upstream erroring above.
+      acc.flags.upstreamError = true;
+      writeLog({ headers: {}, bodySkippedReason: 'upstream_error' });
+    }
+  });
 
   reply.stream.on('end', () => {
     void (async () => {
+      try {
+      // The stream 'close' guard above may have already logged this attempt
+      // (client disconnected while one of the awaits below was pending) —
+      // without this check the writeLog call at the end of this block would
+      // fire a second time for the same attempt.
+      if (logged) return;
       const upstreamTrailers = reply.trailers();
       const upstreamStatus = grpcStatusOf(reply.headers, upstreamTrailers);
       let outStatus = upstreamStatus.status ?? 0;
@@ -998,6 +1203,10 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
         }
       }
 
+      // Re-check here, not just on entry: the awaits above (evaluateResponseMatch,
+      // manipulatorRunner) are real yield points, and the stream 'close' guard
+      // may have logged this attempt as client_aborted while we were suspended.
+      if (logged) return;
       pendingTrailers = {
         'grpc-status': String(outStatus),
         ...(outMessage !== undefined && outMessage !== ''
@@ -1013,9 +1222,29 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
         trailers: outTrailers,
         bodySkippedReason: 'streaming',
       });
+      } catch (err) {
+        if (logged) {
+          runtime.appLog.error('grpc streaming tail error after logging', { error: String(err) });
+        } else if (stream.destroyed && selfDestroyed) {
+          acc.flags.upstreamError = true;
+          writeLog({ headers: {}, bodySkippedReason: 'upstream_error' });
+        } else if (stream.destroyed) {
+          acc.flags.clientAborted = true;
+          writeLog({ headers: {}, bodySkippedReason: 'client_aborted' });
+        } else {
+          acc.ruleErrors.push({
+            ruleId: rule?.id ?? 'unknown',
+            stage: 'response',
+            error: err instanceof Error ? err.message : String(err),
+          });
+          writeLog({ headers: {}, bodySkippedReason: 'internal_error' });
+        }
+        if (!stream.destroyed) stream.destroy();
+      }
     })();
   });
   void headerStageMatched;
+  }
 }
 
 /**

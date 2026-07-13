@@ -1,12 +1,11 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { ToastProvider } from './toast.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Rules } from './views/Rules.tsx';
 import { Logs } from './views/Logs.tsx';
 import { Descriptors } from './views/Descriptors.tsx';
 import { Settings } from './views/Settings.tsx';
-
-type View = 'dashboard' | 'rules' | 'logs' | 'descriptors' | 'settings';
+import { parseLocation, pathFor, type View } from './router.ts';
 
 const NAV: Array<{ id: View; label: string }> = [
   { id: 'dashboard', label: 'Dashboard' },
@@ -17,7 +16,21 @@ const NAV: Array<{ id: View; label: string }> = [
 ];
 
 export function App(): JSX.Element {
-  const [view, setView] = useState<View>('dashboard');
+  const [base] = useState(() => parseLocation(window.location.pathname).base);
+  const [view, setView] = useState<View>(() => parseLocation(window.location.pathname).view);
+
+  useEffect(() => {
+    const onPopState = (): void => setView(parseLocation(window.location.pathname).view);
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const navigate = useCallback((next: View) => {
+    setView(next);
+    const target = pathFor(base, next);
+    if (window.location.pathname !== target) window.history.pushState(null, '', target);
+  }, [base]);
+
   return (
     <ToastProvider>
       <div className="app">
@@ -29,7 +42,7 @@ export function App(): JSX.Element {
               <button
                 key={n.id}
                 className={view === n.id ? 'active' : ''}
-                onClick={() => setView(n.id)}
+                onClick={() => navigate(n.id)}
               >
                 <span>{n.label}</span>
               </button>
@@ -37,7 +50,7 @@ export function App(): JSX.Element {
           </nav>
         </aside>
         <main className="main">
-          {view === 'dashboard' && <Dashboard onNavigate={setView} />}
+          {view === 'dashboard' && <Dashboard onNavigate={navigate} />}
           {view === 'rules' && <Rules />}
           {view === 'logs' && <Logs />}
           {view === 'descriptors' && <Descriptors />}

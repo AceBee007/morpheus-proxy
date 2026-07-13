@@ -286,6 +286,30 @@ describe('logs API (spec 4.2.8)', () => {
     expect(((await cleared.json()) as { removed: number }).removed).toBe(1);
   });
 
+  it('filters by outcome=client_aborted (spec 4.9)', async () => {
+    const { stack } = await setup([captureRule('cap')]);
+    await fetch(`${stack.url}/users/7`);
+    stack.trafficLog.add({
+      startedAt: new Date(),
+      endedAt: new Date(),
+      protocol: 'http',
+      listener: 'http-test',
+      client: '127.0.0.1:1',
+      target: 'http://upstream',
+      request: { headers: {}, bodySkippedReason: 'client_aborted' },
+      response: { headers: {}, bodySkippedReason: 'client_aborted' },
+      outcome: 'client_aborted',
+      loggingReason: 'client_aborted',
+      matchedRules: [],
+    });
+
+    const res = await stack.api('/api/v1/logs?outcome=client_aborted');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ outcome: string }> };
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]?.outcome).toBe('client_aborted');
+  });
+
   it('returns bodyLogged:false metadata when the body was not stored', async () => {
     const { stack } = await setup([
       {
