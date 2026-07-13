@@ -119,7 +119,7 @@ tr.clickable:hover td { background: var(--panel-2); }
 }
 .tag.mock { color: #79c0ff; }
 .tag.fault, .tag.upstream_error, .tag.rule_error { color: var(--err); }
-.tag.modified { color: var(--warn); }
+.tag.modified, .tag.client_aborted { color: var(--warn); }
 .tag.captured, .tag.delayed { color: var(--muted); }
 .tag.passthrough { color: var(--muted); }
 

@@ -4,7 +4,17 @@ import { useToast } from '../toast.tsx';
 import { formatLogTimestamp, resolveTimeZone } from '../time.ts';
 import { JsonBlock } from '../JsonBlock.tsx';
 
-const OUTCOMES = ['', 'captured', 'mock', 'fault', 'modified', 'delayed', 'upstream_error', 'rule_error'];
+const OUTCOMES = [
+  '',
+  'captured',
+  'mock',
+  'fault',
+  'modified',
+  'delayed',
+  'upstream_error',
+  'rule_error',
+  'client_aborted',
+];
 
 export function Logs(): JSX.Element {
   const toast = useToast();

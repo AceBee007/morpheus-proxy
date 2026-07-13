@@ -11,6 +11,7 @@ const OUTCOMES: Outcome[] = [
   'delayed',
   'upstream_error',
   'rule_error',
+  'client_aborted',
 ];
 
 export function parseLogFilter(params: URLSearchParams): LogFilter {

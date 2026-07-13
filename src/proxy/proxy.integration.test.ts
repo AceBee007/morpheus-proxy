@@ -1,5 +1,6 @@
 import http from 'node:http';
 import http2 from 'node:http2';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   startTestProxy,
@@ -639,4 +640,172 @@ describe('websocket/upgrade passthrough (spec 4.1.1)', () => {
     });
     expect(result).toBe('hello-ws');
   });
+});
+
+describe('HTTP attempt logging is guaranteed exactly once (client_aborted)', () => {
+  it('logs rule_error instead of dropping the attempt on an invalid response_replace regex (handleHttpExchange defense-in-depth)', async () => {
+    const { proxy } = await setup({}, (_req, res) => {
+      res.writeHead(200, { 'x-data-source': 'real-db' });
+      res.end('body');
+    });
+    // bypasses validateRule (which would normally reject this pattern) to
+    // prove the guard added around handleHttpExchange holds even so.
+    proxy.ruleStore.create({
+      schemaVersion: 1,
+      id: 'bad-regex',
+      name: '',
+      description: '',
+      enabled: true,
+      priority: 10,
+      protocol: 'http',
+      match: { type: 'regex', field: 'path', pattern: '.' },
+      response: {
+        action: { type: 'response_replace', target: 'header.x-data-source', from: '(', to: 'x' },
+      },
+      logging: { capture: true },
+      createdAt: '',
+      updatedAt: '',
+    });
+    const res = await fetch(`${proxy.url}/`);
+    expect(res.status).toBe(500);
+    const items = proxy.trafficLog.list().items;
+    expect(items).toHaveLength(1);
+    expect(items[0]?.outcome).toBe('rule_error');
+    expect(items[0]?.ruleErrors?.[0]?.error).toBeTruthy();
+  });
+
+  const capAllRule = {
+    id: 'cap-all',
+    protocol: 'http' as const,
+    match: { type: 'regex' as const, field: 'path' as const, pattern: '.' },
+    logging: { capture: true },
+  };
+
+  it('evaluates an aborted partial HTTP/2 request in normal priority order', async () => {
+    const { proxy, upstream } = await setup({
+      rules: [
+        {
+          id: 'fault-once',
+          protocol: 'http',
+          priority: 100,
+          match: { type: 'regex', field: 'path', pattern: '^/partial$' },
+          request: {
+            action: { type: 'fault', fault: { kind: 'http_response', statusCode: 503 } },
+          },
+          consume: { times: 1 },
+        },
+        {
+          ...capAllRule,
+          priority: 1,
+          match: { type: 'regex', field: 'path', pattern: '^/partial$' },
+        },
+      ],
+    });
+    const session = http2.connect(`http://127.0.0.1:${proxy.port}`);
+    cleanups.push(() => Promise.resolve(session.close()));
+    session.on('error', () => {});
+
+    const abortPartial = async (): Promise<void> => {
+      const req = session.request({ ':method': 'POST', ':path': '/partial' });
+      req.on('error', () => {});
+      req.write('incomplete request body');
+      await sleep(20);
+      req.close(http2.constants.NGHTTP2_CANCEL);
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    };
+
+    // The high-priority intercept matches and is consumed; the lower capture
+    // rule is never evaluated for this attempt.
+    await abortPartial();
+    // The exhausted intercept is skipped, so the same partial request now
+    // reaches and records the lower-priority capture rule.
+    await abortPartial();
+
+    const items = proxy.trafficLog.list().items;
+    expect(items).toHaveLength(2);
+    expect(items[1]?.outcome).toBe('client_aborted');
+    expect(items[1]?.matchedRules.map((m) => m.id)).toEqual(['fault-once']);
+    expect(items[0]?.outcome).toBe('client_aborted');
+    expect(items[0]?.matchedRules.map((m) => m.id)).toEqual(['cap-all']);
+    expect(proxy.consume.stateOf(proxy.ruleStore.get('fault-once')!).remaining).toBe(0);
+    expect(upstream.received).toHaveLength(0);
+  });
+
+  // HTTP counterpart of the gRPC test with the same name: a capture-all
+  // observation rule alongside a separate consume-once fault rule, so a
+  // retried request's first (faulted) attempt and second (passthrough)
+  // attempt are both independently visible in Logs.
+  it('records both the faulted attempt and its retry when a capture-all rule sits alongside a consume-once fault', async () => {
+    const { proxy } = await setup({
+      rules: [
+        capAllRule,
+        {
+          id: 'fault-once',
+          protocol: 'http',
+          match: { type: 'regex', field: 'path', pattern: '.' },
+          consume: { times: 1 },
+          response: {
+            action: { type: 'fault', fault: { kind: 'http_response', statusCode: 503, body: 'injected' } },
+          },
+        },
+      ],
+    });
+    const first = await fetch(`${proxy.url}/x`);
+    expect(first.status).toBe(503);
+    const second = await fetch(`${proxy.url}/x`);
+    expect(second.status).toBe(200);
+
+    const items = proxy.trafficLog.list().items;
+    expect(items).toHaveLength(2);
+    const [retry, faulted] = items;
+    expect(faulted?.outcome).toBe('fault');
+    expect(faulted?.matchedRules.map((m) => m.id)).toEqual(['cap-all', 'fault-once']);
+    expect(retry?.outcome).toBe('captured');
+    expect(retry?.matchedRules.map((m) => m.id)).toEqual(['cap-all']);
+  });
+
+  // Same pattern, but the fault is preceded by a delay long enough that the
+  // client cancels before ever seeing it. The first attempt must show
+  // client_aborted, not a misleading 'fault' the client never received.
+  it("records the cancelled attempt as client_aborted (not fault) when the client times out during a fault rule's delay", async () => {
+    const { proxy } = await setup({
+      rules: [
+        capAllRule,
+        {
+          id: 'fault-once',
+          protocol: 'http',
+          match: { type: 'regex', field: 'path', pattern: '.' },
+          consume: { times: 1 },
+          response: {
+            delay: { durationMs: 3000 },
+            action: { type: 'fault', fault: { kind: 'http_response', statusCode: 503, body: 'injected' } },
+          },
+        },
+      ],
+    });
+    const session = http2.connect(`http://127.0.0.1:${proxy.port}`);
+    cleanups.push(() => Promise.resolve(session.close()));
+    session.on('error', () => {});
+    const req1 = session.request({ ':method': 'GET', ':path': '/x' });
+    req1.on('error', () => {});
+    await sleep(200);
+    req1.close(http2.constants.NGHTTP2_CANCEL);
+    await sleep(3200);
+
+    const status2 = await new Promise<number>((resolve) => {
+      const req2 = session.request({ ':method': 'GET', ':path': '/x' });
+      req2.on('response', (headers) => resolve(Number(headers[':status'])));
+      req2.on('error', () => resolve(-1));
+    });
+    expect(status2).toBe(200);
+
+    const items = proxy.trafficLog.list().items;
+    expect(items).toHaveLength(2);
+    const [retry, aborted] = items;
+    expect(aborted?.outcome).toBe('client_aborted');
+    expect(aborted?.matchedRules.map((m) => m.id)).toEqual(['cap-all', 'fault-once']);
+    expect(aborted?.timing?.delayMs).toBe(3000);
+    expect(retry?.outcome).toBe('captured');
+    expect(retry?.matchedRules.map((m) => m.id)).toEqual(['cap-all']);
+  }, 10_000);
 });

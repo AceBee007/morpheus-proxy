@@ -65,6 +65,9 @@ export function h1Exchange(req: http.IncomingMessage, res: http.ServerResponse):
         req.socket.destroy();
       }
     },
+    isDestroyed() {
+      return req.socket.destroyed || res.destroyed;
+    },
   };
 }
 
@@ -125,6 +128,9 @@ export function h2Exchange(stream: http2.ServerHttp2Stream, headers: http2.Incom
       } else {
         stream.destroy();
       }
+    },
+    isDestroyed() {
+      return stream.destroyed;
     },
   };
 }
