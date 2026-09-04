@@ -755,15 +755,26 @@ descriptor も on-memory のため、再起動後は再登録が必要です(常
 morpheus が upstream の `grpc.reflection.v1.ServerReflection`(無ければ `v1alpha`)を呼び、service 一覧と `FileDescriptorProto` 群を取得して descriptor set として登録します(spec 4.7.6)。grpcurl / buf curl / Postman が `.proto` なしで gRPC を叩くときに使うのと同じ仕組みです。
 
 ```sh
+# いちばん簡単: proxy が転送で見た upstream 全部に取りに行く(one-shot)。
+# 既定は descriptor の無い service を持つ target だけが対象。UI の Descriptors 画面のボタンと同じ
+curl -s -X POST "$A/grpc/descriptors:reflect-all" | jq .
+# -> { "imported": 1, "failed": 0, "skipped": 0, "targets": [ { "target": "ms-b:50052", "status": "imported", ... } ] }
+curl -s -X POST "$A/grpc/descriptors:reflect-all" -H 'content-type: application/json' \
+  -d '{"onlyMissing":false}' | jq .     # 全 target を取り直す
+# 観測済み upstream の一覧(どの service に descriptor が無いか)
+curl -s "$A/grpc/reflection" | jq '.observed'
+
 # 明示的に取り込む。target は CONNECT authority / upstream と同じ host:port
 curl -s "$A/grpc/descriptors:reflect" -H 'content-type: application/json' \
   -d '{"target":"ms-b:50052"}' | jq .
 # service を絞る場合
 curl -s "$A/grpc/descriptors:reflect" -H 'content-type: application/json' \
   -d '{"target":"ms-b:50052","symbols":["demo.TimeService"]}' | jq .
-# 取得状況(進行中 / 取得済み / 失敗と再試行時刻 / service ごとの最終 authority)
+# 取得状況(観測済み upstream / 進行中 / 取得済み / 失敗と再試行時刻 / service ごとの最終 authority)
 curl -s "$A/grpc/reflection" | jq .
 ```
+
+`reflect-all` は target ごとの結果を返し、失敗しても HTTP は `200` です(`targets[].status` が `failed` のものに `reason` / `message`)。`reflection.allow` に一致しない target は `skipped`(`skippedBecause: "not_allowed"`)になります。
 
 応答は通常の descriptor 登録と同じ形で、`source` に `{"type":"reflection","target":...,"protocol":"grpc-v1"}` が入ります。同じ target を再取得すると前回分を置き換えます。サーバが一覧に出すのに解決できない service(proto file を登録していない手書きの service など)は skip され、`GET /grpc/reflection` の `imports[].missing` に並びます(明示 `symbols` で指定した場合は skip せず `not_found` エラー)。
 

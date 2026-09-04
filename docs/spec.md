@@ -1176,8 +1176,9 @@ descriptor の入手を手作業(protoc / buf でのビルドとアップロー�
 - 取得した descriptor は `source: { "type": "reflection", "target", "protocol", "symbols", "fetchedAt" }` を持ち、同じ target からの再取得は前回分を置き換える
 - 呼び出しは reflection RPC 単位の `timeoutMs`、合計バイト数の上限 `maxBytes`、`metadata`(認証付き reflection 用の追加メタデータ)で制御する。client の metadata は転送しない
 
-起点は 3 つある。
+起点は 4 つある。
 
+0. **観測済み upstream への one-shot**: proxy は転送した gRPC call の upstream(CONNECT authority、または reverse listener の設定 `upstream`)を、descriptor の有無に関わらず記録する(`GET /_morpheus/api/v1/grpc/reflection` の `observed`。target 数と service 数には上限がある)。`POST /_morpheus/api/v1/grpc/descriptors:reflect-all`(body 省略可。`{ "onlyMissing": false }` で全 target を再取得)は、その全 target に対して取得を行い、target ごとの結果(`imported` / `failed` / `skipped`)を `200` で返す。既定では descriptor の無い service を持つ target だけを対象にし、`reflection.allow` に一致しない target は skip する。UI の gRPC Descriptors 画面のボタンはこれを呼ぶ
 1. **明示**: `POST /_morpheus/api/v1/grpc/descriptors:reflect` に `{ "target": "host:port", "symbols"?: [...], "timeoutMs"?: n }`。成功時は 4.7.3 と同じ descriptor 情報を `201` で返す。失敗は `reflection_failed`(`invalid_target` は `400`、upstream 起因は `502`)で、`details[].reason` に `unimplemented` / `unavailable` / `timeout` / `rejected` / `not_found` / `no_services` / `too_large` / `invalid` のいずれかを入れる
 2. **起動時**: listener の `descriptors` に `{ "reflect": "host:port", "symbols"?: [...] }` を書く。upstream が未起動でも起動をブロックせず、backoff 付きで再試行する(4.13)
 3. **自動**(`reflection.auto: true`、既定は off): descriptor 未登録の method(`/pkg.Service/Method`)を見た時点で、その upstream への import を **バックグラウンドで** 起動する。当該 request は従来どおり streaming として素通し(4.7.5)、以降の request から unary 判定・decode・body logging・mock・manipulation が効く。同じ target への import は single-flight で 1 回にまとめ、失敗した target は `negativeTtlMs` の間は再試行しない。target が応答したが該当 service を持たない場合も同じ期間は再問い合わせしない。`reflection.allow`(authority の glob)に一致しない target には問い合わせない
@@ -1632,7 +1633,7 @@ UI は proxy の現在状態を可視化し、テスト中に素早く rule を�
 | Rules | rule 一覧、検索、enable / disable、priority 変更、状態 reset、import / export |
 | Rule Editor | matcher / request / response / consume 設定、script 編集、validation、simulation |
 | Logs | request / response log 一覧、filter、詳細、diff、raw download |
-| gRPC Descriptors | descriptor 登録(手動アップロード / upstream からの reflection 取得)、service / method / 出自の確認 |
+| gRPC Descriptors | descriptor 登録(手動アップロード / upstream からの reflection 取得 / 観測済み upstream への one-shot 取得ボタン)、service / method / 出自の確認 |
 | Settings | log retention 表示、mask 設定編集、script sandbox 状態、log 表示 timezone 設定 |
 
 ### 5.3 Rules 画面

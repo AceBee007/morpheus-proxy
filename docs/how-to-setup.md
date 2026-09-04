@@ -224,6 +224,9 @@ kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- "
 # 2') reflection.auto を有効にしている場合: 下流ごとに descriptor が取り込まれたことを確認
 #     (imports に target が並ぶ。failures に unimplemented があればその下流は reflection 非公開)
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- "$A/grpc/reflection"
+# 2'') auto を使わない場合: traffic を流したあとに one-shot で観測済み下流から取り込む
+#      (Web UI の gRPC Descriptors 画面「Import missing descriptors」ボタンと同じ)
+kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- --post-data='' "$A/grpc/descriptors:reflect-all"
 
 # 3) (任意) morpheus → 下流が istio-proxy を通っている証拠: envoy の下流クラスタ統計が増える
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c istio-proxy -- \

@@ -139,6 +139,14 @@ The import target is whatever CONNECT authority `ms-a` used — with grpc-go's
 default DNS resolver that is the resolved IP (`172.x.x.x:50052`); a client using
 the passthrough resolver would show `ms-b:50052`.
 
+With `reflection.auto` off you can still import in one shot from every upstream
+the proxy has seen — the "Import missing descriptors" button on the Descriptors
+page of the web UI, or:
+
+```sh
+curl -s -X POST "$A/grpc/descriptors:reflect-all" | jq .
+```
+
 To import explicitly instead (or for an upstream you have not called yet):
 
 ```sh
