@@ -1112,6 +1112,8 @@ gRPC body を JSON として matcher / manipulator に渡すには descriptor �
 GET    /_morpheus/api/v1/grpc/descriptors
 POST   /_morpheus/api/v1/grpc/descriptors
 DELETE /_morpheus/api/v1/grpc/descriptors/:id
+POST   /_morpheus/api/v1/grpc/descriptors:reflect   (upstream から取得、4.7.6)
+GET    /_morpheus/api/v1/grpc/reflection            (取得状況、4.7.6)
 ```
 
 登録形式:
@@ -1119,6 +1121,9 @@ DELETE /_morpheus/api/v1/grpc/descriptors/:id
 - protobuf descriptor set binary
 - `.proto` file set
 - service mapping only
+- server reflection による upstream からの取得(4.7.6。取得結果は descriptor set として登録される)
+
+登録された descriptor は出自 `source` を持つ(`upload` / `file` / `reflection`)。
 
 登録時 validation:
 
@@ -1157,6 +1162,32 @@ descriptor によって streaming method と判定された RPC、または desc
 - `messages` を含む mock / patch、`replace_body` は適用せず、rule validation 時に warning、実行時には skip として log に記録する
 - streaming の body logging は行わない(metadata / trailer / status のみ記録する)
 - response 段階の `grpc.status` / `grpc.trailer.<name>` は trailer 到達時に評価できる。trailer の書き換え(script manipulator の `trailers` / `grpcStatus` / `grpcMessage` patch)は upstream trailer を受信してから client へ返す trailer に適用する
+
+#### 4.7.6 Server reflection による descriptor 取得
+
+descriptor の入手を手作業(protoc / buf でのビルドとアップロード)に頼らず、proxy 自身が upstream から取得できる経路として gRPC Server Reflection をサポートする。Server Reflection は gRPC 公式の標準サービス(`grpc.reflection.v1.ServerReflection` の `ServerReflectionInfo`、旧版 `grpc.reflection.v1alpha`)で、サーバが自身の descriptor を実行時に配る仕組みである。grpcurl / buf curl / Postman などの汎用ツールが schema 取得に使うものと同じであり、特定の環境やフレームワークに依存しない。
+
+取得手順:
+
+- 問い合わせ先は **その traffic の upstream そのもの**(CONNECT listener では CONNECT authority、reverse listener では設定 `upstream`)。通常の転送と同じ経路(Pod egress → mesh)を通る
+- `grpc.reflection.v1` を試し、`UNIMPLEMENTED` なら `v1alpha` にフォールバックする(message は同一で package 名だけが異なる)
+- `list_services` で service 一覧を取り(明示 `symbols` 指定時は省略)、service ごとに `file_containing_symbol` で `FileDescriptorProto` 群(推移的依存込み)を取得する。応答間の重複はファイル名で除去し、`FileDescriptorSet` として 4.7.3 の descriptor set 登録経路に流す。reflection / health / channelz の service は取得対象にしない
+- 一覧に出るがサーバが解決できない service(`NOT_FOUND`。proto file を登録していない手書きの service descriptor など)は skip して残りを取り込み、`missing` として記録する。明示 `symbols` の service が解決できない場合は部分取り込みせず `not_found` で失敗する。全 service が解決できなければ `not_found`
+- 取得した descriptor は `source: { "type": "reflection", "target", "protocol", "symbols", "fetchedAt" }` を持ち、同じ target からの再取得は前回分を置き換える
+- 呼び出しは reflection RPC 単位の `timeoutMs`、合計バイト数の上限 `maxBytes`、`metadata`(認証付き reflection 用の追加メタデータ)で制御する。client の metadata は転送しない
+
+起点は 3 つある。
+
+1. **明示**: `POST /_morpheus/api/v1/grpc/descriptors:reflect` に `{ "target": "host:port", "symbols"?: [...], "timeoutMs"?: n }`。成功時は 4.7.3 と同じ descriptor 情報を `201` で返す。失敗は `reflection_failed`(`invalid_target` は `400`、upstream 起因は `502`)で、`details[].reason` に `unimplemented` / `unavailable` / `timeout` / `rejected` / `not_found` / `no_services` / `too_large` / `invalid` のいずれかを入れる
+2. **起動時**: listener の `descriptors` に `{ "reflect": "host:port", "symbols"?: [...] }` を書く。upstream が未起動でも起動をブロックせず、backoff 付きで再試行する(4.13)
+3. **自動**(`reflection.auto: true`、既定は off): descriptor 未登録の method(`/pkg.Service/Method`)を見た時点で、その upstream への import を **バックグラウンドで** 起動する。当該 request は従来どおり streaming として素通し(4.7.5)、以降の request から unary 判定・decode・body logging・mock・manipulation が効く。同じ target への import は single-flight で 1 回にまとめ、失敗した target は `negativeTtlMs` の間は再試行しない。target が応答したが該当 service を持たない場合も同じ期間は再問い合わせしない。`reflection.allow`(authority の glob)に一致しない target には問い合わせない
+
+制約:
+
+- reflection はサーバ側が opt-in で有効化する機能であり、公開していないサーバもある。その場合は従来どおり descriptor set / `.proto` の登録にフォールバックする(自動取得は `unimplemented` を記録し、素通しを続ける)
+- 自動取得では最初の request は decode / mock の対象にならない。最初から効かせたい場合は起動時取得または明示取得を使う
+- 取得した descriptor もオンメモリであり、再起動で消える。常設は `descriptors` の `reflect` エントリで行う
+- 状態は `GET /_morpheus/api/v1/grpc/reflection`(in-flight / imports / failures / service → authority の last seen)と metrics の reflection import count(結果別)で観測できる
 
 ### 4.8 HTTP handling
 
@@ -1442,6 +1473,7 @@ Core は以下を提供する。
 - upstream latency histogram
 - fault injection count
 - script error count
+- reflection import count(結果別、4.7.6)
 
 Metrics endpoint:
 
@@ -1463,6 +1495,7 @@ Config 読み込み要件:
 - config file が存在しない、読めない、JSONC parse に失敗した場合は、hard coded default 全体で起動し、warning を application log と stderr に出す
 - config の一部の key が schema validation に失敗した場合は、その key だけ hard coded default に fallback し、warning を出す。validation に成功した key はその値を使用する
 - 参照 descriptor file が読めない場合は、その descriptor だけ skip して warning を出し、起動は継続する
+- `descriptors` の reflection 指定(`{ "reflect": "host:port" }`、4.7.6)は起動をブロックせず、upstream に到達できるまで backoff 付きで再試行する
 - env var による override は config path などの deployment-specific な項目に限定する
 
 ```jsonc
@@ -1490,7 +1523,8 @@ Config 読み込み要件:
       "host": "0.0.0.0",
       "port": 15051,
       "upstream": "h2c://127.0.0.1:50051",
-      // Descriptor files are required for gRPC body decode/edit.
+      // Descriptors are required for gRPC body decode/edit: file paths, or
+      // { "reflect": "host:port" } to import them from the upstream (4.7.6).
       "descriptors": [],
       "maxRequestBodyBufferBytes": 1048576,
       "maxResponseBodyBufferBytes": 1048576
@@ -1511,6 +1545,15 @@ Config 読み込み要件:
     "upstreamTimeoutMs": 30000,
     "idleTimeoutMs": 60000
   },
+  // gRPC server reflection (4.7.6)
+  "reflection": {
+    "auto": false,
+    "allow": ["*"],
+    "timeoutMs": 3000,
+    "negativeTtlMs": 60000,
+    "maxBytes": 16777216,
+    "metadata": {}
+  },
   "logging": {
     "trafficLogDir": "logs/morpheus-proxy/traffic",
     "appLogDir": "logs/morpheus-proxy/app",
@@ -1528,6 +1571,7 @@ Config 読み込み要件:
 
 - `rules.presets` の各 entry は rule model(4.3)と同じ形式とする。validation に失敗した preset rule はその rule だけ skip して warning を出す
 - `logging.mask` は起動時の初期値であり、起動後は Masking API(4.2.9)で編集できる(on-memory)
+- `reflection` は server reflection による descriptor 取得の設定(4.7.6)。`auto` は on-demand 取得の有効化(既定 off)、`allow` は問い合わせてよい authority の glob、`timeoutMs` / `negativeTtlMs` / `maxBytes` / `metadata` は取得の制御値
 - listener の `mode`(optional、既定 `reverse`)で ingress 方式を選ぶ。`mode: "connect"` の listener は `upstream` を取らない(CONNECT authority が upstream になる / 4.14)
 
 ### 4.14 CONNECT egress listener(client proxy 経由の傍受)
@@ -1588,7 +1632,7 @@ UI は proxy の現在状態を可視化し、テスト中に素早く rule を�
 | Rules | rule 一覧、検索、enable / disable、priority 変更、状態 reset、import / export |
 | Rule Editor | matcher / request / response / consume 設定、script 編集、validation、simulation |
 | Logs | request / response log 一覧、filter、詳細、diff、raw download |
-| gRPC Descriptors | descriptor 登録、service / method 確認 |
+| gRPC Descriptors | descriptor 登録(手動アップロード / upstream からの reflection 取得)、service / method / 出自の確認 |
 | Settings | log retention 表示、mask 設定編集、script sandbox 状態、log 表示 timezone 設定 |
 
 ### 5.3 Rules 画面

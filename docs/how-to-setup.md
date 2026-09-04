@@ -92,6 +92,9 @@ data:
         // { "name": "http-egress", "protocol": "http", "host": "127.0.0.1", "port": 15053,
         //   "mode": "connect" }
       ],
+      // 下流が gRPC server reflection を公開していれば、descriptor は morpheus が
+      // 下流から自動取得する(spec 4.7.6)。手動の proto 登録は不要になる
+      "reflection": { "auto": true },
       "logging": { "trafficLogDir": "/tmp/morpheus/traffic", "appLogDir": "/tmp/morpheus/app" }
     }
 ```
@@ -101,7 +104,10 @@ data:
   このファイルは既定値のリファレンスで、アプリが読み込むことはありません(書かなかった key はその既定値で動きます)
 - 恒久的に効かせたいルールがある場合は `rules.presets`（配列、要素は rule 定義）に書けます。
   ルールは on-memory で Pod 再起動時に消えるため、常設ルールは presets、実験は admin API を使い分けます
-- gRPC の body(message)を扱うルールには descriptor 登録が必要です(spec 4.7)
+- gRPC の body(message)を扱うルールには descriptor が必要です(spec 4.7)。下流が server reflection を
+  公開していれば `reflection.auto: true` で自動取得され(最初の 1 リクエストは素通し、以降は decode 可)、
+  起動時に確実に揃えたい下流は `"descriptors": [{ "reflect": "<downstream>:<port>" }]` と書きます。
+  reflection が無い下流だけ、descriptor set / `.proto` を admin API で登録します(api-manual §13)
 
 ## 4. Deployment にサイドカーを追加
 
@@ -215,6 +221,10 @@ kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- \
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- "$A/logs?limit=5"
 # 各エントリの "listener":"grpc-egress" と "target":"h2c://<下流>:<port>" を確認
 
+# 2') reflection.auto を有効にしている場合: 下流ごとに descriptor が取り込まれたことを確認
+#     (imports に target が並ぶ。failures に unimplemented があればその下流は reflection 非公開)
+kubectl --context=$CTX -n <NAMESPACE> exec $POD -c morpheus-proxy -- wget -qO- "$A/grpc/reflection"
+
 # 3) (任意) morpheus → 下流が istio-proxy を通っている証拠: envoy の下流クラスタ統計が増える
 kubectl --context=$CTX -n <NAMESPACE> exec $POD -c istio-proxy -- \
   pilot-agent request GET clusters | grep -E '<downstream>.*rq_total'
@@ -238,8 +248,10 @@ kubectl exec $POD -c morpheus-proxy -- wget -qO- --header='content-type: applica
 
 他に response header の置換(`response_replace`)、response body の改変(`script_manipulator`)、
 遅延(`delay`)、mock(`mock_response`)が使えます。gRPC で body を mock / 改変する場合は
-descriptor 登録が必要です(`POST /_morpheus/api/v1/grpc/descriptors` に `.proto` を投入。
-詳細は [docs/spec.md](spec.md) の 4.5 / 4.7)。
+descriptor が必要です。下流が reflection を公開していれば `reflection.auto` で自動取得されるか、
+`POST /_morpheus/api/v1/grpc/descriptors:reflect` に `{"target":"<downstream>:<port>"}` を投げて
+明示的に取り込めます。reflection が無い下流は `POST /_morpheus/api/v1/grpc/descriptors` に
+descriptor set / `.proto` を登録します(詳細は [docs/spec.md](spec.md) の 4.5 / 4.7、api-manual §13)。
 
 admin API / Web UI をローカルから触るには port-forward:
 
@@ -281,7 +293,8 @@ ConfigMap volume を外して apply するだけです。下流アドレスも S
   `rules:import` を使う。
 - **body を扱うルールのみバッファリング**: 単純な header/path matcher や素通しでは body を
   読まない(既定 1 MiB 上限、config で変更可)。
-- **gRPC の body 操作は descriptor 必須**: 未登録なら metadata / grpc-status のみ扱える。
+- **gRPC の body 操作は descriptor 必須**: 未登録なら metadata / grpc-status のみ扱える。reflection は
+  サーバ側 opt-in の機能なので、公開していない下流には効かない(その場合は手動登録)。
 
 ## 付録 A: reverse 方式(参考・通常は不要)
 

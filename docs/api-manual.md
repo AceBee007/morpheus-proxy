@@ -37,7 +37,8 @@ kubectl --context=<context> -n <namespace> port-forward pod/<pod> 18081:18081
 
   | HTTP status | code 例 | 意味 |
   | --- | --- | --- |
-  | `400` | `rule_validation_failed` / `invalid_json` / `invalid_query` / `duplicate_rule_id` / `descriptor_validation_failed` | 入力不正 |
+  | `400` | `rule_validation_failed` / `invalid_json` / `invalid_query` / `duplicate_rule_id` / `descriptor_validation_failed` / `invalid_reflection_request` / `reflection_unavailable` | 入力不正 |
+  | `400` / `502` | `reflection_failed` | reflection による descriptor 取得の失敗(`details[].reason` に原因。`invalid_target` のみ `400`) |
   | `404` | `rule_not_found` / `log_not_found` / `descriptor_not_found` | 対象なし |
   | `409` | `revision_conflict` | `expectedRevision` が古い |
   | `500` | `internal_error` | proxy 内部エラー |
@@ -46,7 +47,7 @@ kubectl --context=<context> -n <namespace> port-forward pod/<pod> 18081:18081
   - `PUT /rules/:id`、`DELETE /rules/:id`、`POST /rules:disable-all`: query parameter(`?expectedRevision=12`)
   - `POST /rules:import`: request body 内の `expectedRevision` フィールド
   - 不一致の場合は `409 revision_conflict` が返るので、`GET /rules` で再取得してからやり直します。
-- rule / descriptor / mask 設定は on-memory です。Pod / process が再起動すると消えるため、共有や再利用には export / import、常設には config の `rules.presets` を使います。
+- rule / descriptor / mask 設定は on-memory です。Pod / process が再起動すると消えるため、共有や再利用には export / import、常設には config の `rules.presets` と `descriptors`(ファイルまたは `{ "reflect": "host:port" }`)を使います。
 - list logs は `limit` と `cursor` の cursor pagination です。`limit` の既定は 50、最大 200。応答は `{ "items": [...], "nextCursor": "<id>" | null }` で、`nextCursor` を次の `cursor` に渡します。
 - admin API の request body は最大 5 MiB です(descriptor 登録もこの制限内)。
 - **rule は、rule の `protocol` と同じ protocol の listener を通る traffic にだけ適用されます**(HTTP rule は `protocol: "http"` の listener、gRPC rule は `protocol: "grpc"` の listener)。自環境にどの listener があるかは `GET /status` で確認できます。listener の無い protocol の rule は登録できますが、実 traffic には当たりません(validation / simulation での確認は可能)。
@@ -739,7 +740,70 @@ curl -s -X DELETE "$A/logs" | jq .
 
 gRPC body の decode、body matcher、mock `messages`、message manipulation、body logging には descriptor が必要です。
 metadata / path / grpc-status のみを扱う rule は descriptor なしで使えます。
-descriptor も on-memory のため、再起動後は再登録が必要です。
+descriptor も on-memory のため、再起動後は再登録が必要です(常設は config、下記)。
+
+入手経路は 3 つあります。まず reflection を試し、サーバが公開していない場合に descriptor set / `.proto` を使うのが楽です。
+
+| 経路 | 向いている場面 | 必要なもの |
+| --- | --- | --- |
+| **server reflection**(推奨) | upstream が gRPC server reflection を公開している(grpc-go / grpc-java / .NET / tonic など多くの実装で 1 行で有効化される) | なし。morpheus が upstream に問い合わせる |
+| descriptor set(`protoc --include_imports` / `buf build`) | reflection が無い、複数ファイル構成の proto | ビルド済み `.binpb` |
+| `.proto` source | 依存の無い小さな proto | `.proto` テキスト |
+
+### upstream から取得する(server reflection)
+
+morpheus が upstream の `grpc.reflection.v1.ServerReflection`(無ければ `v1alpha`)を呼び、service 一覧と `FileDescriptorProto` 群を取得して descriptor set として登録します(spec 4.7.6)。grpcurl / buf curl / Postman が `.proto` なしで gRPC を叩くときに使うのと同じ仕組みです。
+
+```sh
+# 明示的に取り込む。target は CONNECT authority / upstream と同じ host:port
+curl -s "$A/grpc/descriptors:reflect" -H 'content-type: application/json' \
+  -d '{"target":"ms-b:50052"}' | jq .
+# service を絞る場合
+curl -s "$A/grpc/descriptors:reflect" -H 'content-type: application/json' \
+  -d '{"target":"ms-b:50052","symbols":["demo.TimeService"]}' | jq .
+# 取得状況(進行中 / 取得済み / 失敗と再試行時刻 / service ごとの最終 authority)
+curl -s "$A/grpc/reflection" | jq .
+```
+
+応答は通常の descriptor 登録と同じ形で、`source` に `{"type":"reflection","target":...,"protocol":"grpc-v1"}` が入ります。同じ target を再取得すると前回分を置き換えます。サーバが一覧に出すのに解決できない service(proto file を登録していない手書きの service など)は skip され、`GET /grpc/reflection` の `imports[].missing` に並びます(明示 `symbols` で指定した場合は skip せず `not_found` エラー)。
+
+失敗は `reflection_failed` で返り、`details[0].reason` が原因です:
+
+| reason | 意味 | 対処 |
+| --- | --- | --- |
+| `unimplemented` | upstream が reflection を公開していない | descriptor set / `.proto` を登録する |
+| `unavailable` / `timeout` | 到達できない / 遅い | target(`host:port`)と経路を確認。`timeoutMs` を増やす |
+| `rejected` | reflection が拒否した(認証など) | config `reflection.metadata` に必要なメタデータを設定 |
+| `not_found` | 指定 `symbols` をサーバが知らない / 一覧の service を 1 つも解決できない | `symbols` 省略で名前を確認。サーバ側が proto file を登録しているか(生成コードか)を確認 |
+| `too_large` / `invalid` | 上限超過 / 壊れた descriptor | `reflection.maxBytes` を見直す / サーバ側を確認 |
+
+config で常設・自動化できます(spec 4.13):
+
+```jsonc
+{
+  "listeners": [
+    { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1", "port": 15052, "mode": "connect",
+      // 起動時に取得(upstream 未起動なら backoff で再試行、起動はブロックしない)
+      "descriptors": [{ "reflect": "ms-b:50052" }] }
+  ],
+  "reflection": {
+    // descriptor の無い method を見たら、その upstream から自動で取得する(既定 false)。
+    // 最初の 1 リクエストは従来どおり素通し、以降は decode / mock / 改変が効く
+    "auto": true,
+    "allow": ["*"],            // 問い合わせてよい authority(glob)
+    "timeoutMs": 3000,
+    "negativeTtlMs": 60000,    // 失敗した target を放置する時間
+    "maxBytes": 16777216,
+    "metadata": {}             // 認証付き reflection 向けの追加メタデータ
+  }
+}
+```
+
+注意:
+
+- reflection は **サーバ側の opt-in** です(dev のみ有効にする運用も多い)。公開していないサーバでは自動取得は `unimplemented` を記録して素通しを続けるので、その場合は下の手動登録を使います
+- `auto` の取得は request をブロックしません。最初から効かせたい場合は `descriptors` の `reflect` か明示取得を使ってください
+- reflection で取れるのは **サーバがコンパイル済みのスキーマ** です。client 側の proto の版とずれることはありますが、protobuf の互換範囲なら問題になりません
 
 ### `.proto` source の登録
 
@@ -757,10 +821,11 @@ JSON
 
 応答には `id`(`desc-xxxxxxxx` 形式)と、解決された `services[]`(fullName / methods / streaming フラグ)が含まれます。rule が対象にする service / method がここに出ていることを確認してください。
 
-**import の制約**: `proto_source` では well-known types(`google/protobuf/*.proto`: timestamp / duration / struct / wrappers / empty / any / field_mask など)の import だけが自動解決されます。**自作 proto の import は解決できません**。社内サービスのように複数ファイル構成の proto は、次のどちらかにします。
+**import の制約**: `proto_source` では well-known types(`google/protobuf/*.proto`: timestamp / duration / struct / wrappers / empty / any / field_mask など)の import だけが自動解決されます。**自作 proto の import は解決できません**。複数ファイル構成の proto は、次のいずれかにします。
 
-1. 依存をひとつの `.proto` に手動で統合して `proto_source` で登録する(小規模ならこれで十分)
-2. `descriptor_set` で登録する(**推奨**。依存込みでそのまま入る)
+1. upstream が reflection を公開していれば **reflection で取得する**(上記。依存込みで入る)
+2. `descriptor_set` で登録する(依存込みでそのまま入る)
+3. 依存をひとつの `.proto` に手動で統合して `proto_source` で登録する(小規模ならこれで十分)
 
 ### descriptor set binary の登録
 
