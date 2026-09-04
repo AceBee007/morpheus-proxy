@@ -8,9 +8,10 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { writeFileSync } from 'node:fs';
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
-import { defaultConfig } from '../config/defaults.js';
+import { defaultConfig, defaultReflection } from '../config/defaults.js';
 import type { ListenerConfig } from '../config/types.js';
 import { DescriptorRegistry } from '../grpc/descriptors.js';
+import { ReflectionImporter } from '../grpc/reflection-import.js';
 import { grpcBodyValidatorFor } from '../grpc/rule-validation.js';
 import { nullLogger } from '../logging/app-log.js';
 import { MaskRegistry } from '../logging/mask.js';
@@ -21,6 +22,7 @@ import { RuleStore } from '../rules/store.js';
 import type { Rule } from '../rules/types.js';
 import { validateRule } from '../rules/validate.js';
 import { startTestUpstream, type TestUpstream } from '../testing/harness.js';
+import { startReflectionUpstream } from '../testing/reflection-server.js';
 import { startConnectListener, type ConnectRuntime } from './connect-listener.js';
 import type { StartedListener } from './http-listener.js';
 
@@ -37,6 +39,7 @@ async function startConnect(opts: {
   protocol: 'http' | 'grpc';
   rules?: unknown[];
   descriptors?: DescriptorRegistry;
+  reflection?: ReflectionImporter;
 }): Promise<ConnectStack> {
   const consume = new ConsumeRegistry();
   const ruleStore = new RuleStore({ onRuleChanged: (id) => consume.reset(id) });
@@ -82,6 +85,7 @@ async function startConnect(opts: {
     appLog: nullLogger(),
     metrics: new MetricsRegistry(),
     descriptors,
+    ...(opts.reflection ? { reflection: opts.reflection } : {}),
   };
   const listener = await startConnectListener(runtime);
   return {
@@ -399,5 +403,147 @@ describe('CONNECT-inspect listener — gRPC via grpc_proxy (spec 4.14)', () => {
     expect(items).toHaveLength(1);
     expect(items[0]?.outcome).toBe('client_aborted');
     expect(items[0]?.target).toBe(`h2c://127.0.0.1:${upstreamPort}`);
+  });
+});
+
+describe('CONNECT-inspect listener — descriptors imported via server reflection (spec 4.7.6)', () => {
+  let savedProxy: string | undefined;
+  afterEach(() => {
+    if (savedProxy === undefined) delete process.env['grpc_proxy'];
+    else process.env['grpc_proxy'] = savedProxy;
+  });
+
+  it('imports the CONNECT authority descriptors on demand, then decodes and mocks later calls', async () => {
+    const upstream = await startReflectionUpstream({
+      protoSource: GRPC_PROTO,
+      serviceName: 'demo.TimeService',
+      handlers: {
+        Now: (
+          _call: grpc.ServerUnaryCall<{ tz: string }, NowResponse>,
+          callback: grpc.sendUnaryData<NowResponse>,
+        ) => callback(null, { iso: '2026-06-10T00:00:00.000Z', source: 'real' }),
+      },
+    });
+    cleanups.push(() => upstream.close());
+
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: { ...defaultReflection(), auto: true },
+    });
+    const stack = await startConnect({
+      protocol: 'grpc',
+      descriptors,
+      reflection,
+      rules: [
+        {
+          id: 'cap-all',
+          protocol: 'grpc',
+          match: { type: 'regex', field: 'path', pattern: '^/' },
+          logging: { capture: true },
+        },
+      ],
+    });
+    cleanups.push(() => stack.close());
+
+    savedProxy = process.env['grpc_proxy'];
+    process.env['grpc_proxy'] = `http://127.0.0.1:${stack.port}`;
+    const pkg = grpc.loadPackageDefinition(upstream.packageDefinition)['demo'] as grpc.GrpcObject;
+    const Ctor = pkg['TimeService'] as unknown as new (
+      a: string,
+      c: grpc.ChannelCredentials,
+    ) => TimeClient;
+    const client = new Ctor(upstream.target, grpc.credentials.createInsecure());
+    cleanups.push(() => client.close());
+    const callNow = (): Promise<{ response?: NowResponse; error?: grpc.ServiceError }> =>
+      new Promise((resolve) => {
+        client.Now({ tz: 'utc' }, new grpc.Metadata(), (error, response) =>
+          resolve({ ...(error ? { error } : {}), ...(response ? { response } : {}) }),
+        );
+      });
+
+    // 1) first call: no descriptor yet -> relayed as a stream, import kicked off in the background
+    const first = await callNow();
+    expect(first.error).toBeUndefined();
+    expect(first.response?.source).toBe('real');
+    for (let i = 0; i < 100 && !descriptors.hasService('demo.TimeService'); i++) await sleep(20);
+    expect(descriptors.hasService('demo.TimeService')).toBe(true);
+    expect(reflection.status().imports[0]).toMatchObject({ target: upstream.target, protocol: 'grpc-v1' });
+    expect(upstream.reflectionRequests.length).toBeGreaterThanOrEqual(2);
+
+    // 2) second call: unary handling with the imported schema -> decoded body in the log
+    const second = await callNow();
+    expect(second.response?.source).toBe('real');
+    const entries = stack.trafficLog
+      .list()
+      .items.slice()
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    expect(entries).toHaveLength(2);
+    expect(entries[0]?.response.bodyLogged).toBe(false);
+    expect(entries[1]?.response.bodyLogged).toBe(true);
+    expect(entries[1]?.target).toBe(`h2c://${upstream.target}`);
+
+    // 3) message-level rules validate against the imported schema and apply
+    stack.addRule({
+      id: 'mock-now',
+      protocol: 'grpc',
+      priority: 100,
+      match: { type: 'regex', field: 'path', pattern: '^/demo\\.TimeService/Now$' },
+      request: {
+        action: {
+          type: 'mock_response',
+          response: { grpcStatus: 0, messages: [{ iso: 'mocked', source: 'mock' }] },
+        },
+      },
+    });
+    const third = await callNow();
+    expect(third.error).toBeUndefined();
+    expect(third.response).toEqual({ iso: 'mocked', source: 'mock' });
+    // the reflection service itself is never imported or logged as application traffic
+    expect(descriptors.hasService('grpc.reflection.v1.ServerReflection')).toBe(false);
+  });
+
+  it('leaves traffic untouched when the upstream has no reflection (negative cache, no retry storm)', async () => {
+    const upstream = await startReflectionUpstream({
+      protoSource: GRPC_PROTO,
+      serviceName: 'demo.TimeService',
+      protocols: [],
+      handlers: {
+        Now: (
+          _call: grpc.ServerUnaryCall<{ tz: string }, NowResponse>,
+          callback: grpc.sendUnaryData<NowResponse>,
+        ) => callback(null, { iso: 'x', source: 'real' }),
+      },
+    });
+    cleanups.push(() => upstream.close());
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: { ...defaultReflection(), auto: true },
+    });
+    const stack = await startConnect({ protocol: 'grpc', descriptors, reflection });
+    cleanups.push(() => stack.close());
+    savedProxy = process.env['grpc_proxy'];
+    process.env['grpc_proxy'] = `http://127.0.0.1:${stack.port}`;
+    const pkg = grpc.loadPackageDefinition(upstream.packageDefinition)['demo'] as grpc.GrpcObject;
+    const Ctor = pkg['TimeService'] as unknown as new (a: string, c: grpc.ChannelCredentials) => TimeClient;
+    const client = new Ctor(upstream.target, grpc.credentials.createInsecure());
+    cleanups.push(() => client.close());
+
+    for (let i = 0; i < 3; i++) {
+      const result = await new Promise<{ response?: NowResponse; error?: grpc.ServiceError }>((resolve) => {
+        client.Now({ tz: 'utc' }, new grpc.Metadata(), (error, response) =>
+          resolve({ ...(error ? { error } : {}), ...(response ? { response } : {}) }),
+        );
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.response?.source).toBe('real');
+    }
+    for (let i = 0; i < 50 && reflection.status().failures.length === 0; i++) await sleep(20);
+    const status = reflection.status();
+    expect(status.failures).toEqual([expect.objectContaining({ target: upstream.target, reason: 'unimplemented' })]);
+    expect(descriptors.list()).toEqual([]);
   });
 });

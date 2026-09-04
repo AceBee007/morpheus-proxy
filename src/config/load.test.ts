@@ -237,3 +237,70 @@ describe('loadConfig', () => {
     expect(result.warnings.some((w) => w.includes('defaultTimeoutMs exceeds'))).toBe(true);
   });
 });
+
+describe('reflection settings and descriptor sources (spec 4.7.6)', () => {
+  it('keeps file paths and reflection sources in listeners[].descriptors, skipping invalid entries', () => {
+    const path = writeConfig(
+      'descriptors.jsonc',
+      `{ "listeners": [{
+        "name": "g", "protocol": "grpc", "upstream": "h2c://127.0.0.1:50051",
+        "descriptors": [
+          "a.proto",
+          { "reflect": "svc:50051", "symbols": ["pkg.Svc"] },
+          { "reflect": "svc:50052", "symbols": "pkg.Svc", "extra": 1 },
+          { "bogus": true },
+          7
+        ]
+      }] }`,
+    );
+    const result = loadConfig({ cwd: dir, argv: ['--config', path] });
+    expect(result.config.listeners[0]?.descriptors).toEqual([
+      'a.proto',
+      { reflect: 'svc:50051', symbols: ['pkg.Svc'] },
+      { reflect: 'svc:50052' },
+    ]);
+    const text = result.warnings.join('\n');
+    expect(text).toContain('descriptors[2].symbols');
+    expect(text).toContain('descriptors[2].extra');
+    expect(text).toContain('descriptors[3] must be a file path');
+    expect(text).toContain('descriptors[4] must be a file path');
+  });
+
+  it('reads the reflection section and falls back per key', () => {
+    const path = writeConfig(
+      'reflection.jsonc',
+      `{ "reflection": {
+        "auto": true,
+        "allow": ["*:50052"],
+        "timeoutMs": 500,
+        "negativeTtlMs": "soon",
+        "metadata": { "x-api-key": "test-only" },
+        "bogus": 1
+      } }`,
+    );
+    const result = loadConfig({ cwd: dir, argv: ['--config', path] });
+    expect(result.config.reflection).toEqual({
+      ...defaultConfig().reflection,
+      auto: true,
+      allow: ['*:50052'],
+      timeoutMs: 500,
+      metadata: { 'x-api-key': 'test-only' },
+    });
+    const text = result.warnings.join('\n');
+    expect(text).toContain('reflection.negativeTtlMs');
+    expect(text).toContain('unknown key reflection.bogus');
+    expect(text).not.toContain('unknown key reflection is ignored');
+  });
+
+  it('defaults reflection to opt-in (auto off, every target allowed)', () => {
+    const result = loadConfig({ cwd: dir });
+    expect(result.config.reflection).toEqual({
+      auto: false,
+      allow: ['*'],
+      timeoutMs: 3_000,
+      negativeTtlMs: 60_000,
+      maxBytes: 16_777_216,
+      metadata: {},
+    });
+  });
+});
