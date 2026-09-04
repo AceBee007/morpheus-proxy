@@ -168,6 +168,20 @@ export async function handleHttpExchange(
     let result: BodyReadResult;
     try {
       result = await readBodyUpTo(exchange.bodyStream, requestLimit);
+      if (
+        result.complete &&
+        contentLength !== undefined &&
+        result.buffer.byteLength < contentLength
+      ) {
+        // The stream ended before the declared content-length was delivered:
+        // the client gave up mid-body (an HTTP/2 half-close followed by
+        // RST_STREAM looks like a normal end first). An incomplete request is
+        // never forwarded; treat it like any other client abort — decided from
+        // the bytes, not from the timing of the trailing reset.
+        throw new Error(
+          `request body ended after ${result.buffer.byteLength} of ${contentLength} declared bytes`,
+        );
+      }
     } catch {
       // The body is incomplete, but rule ordering and consumption still apply:
       // evaluate body-independent matchers in the same priority order as an
