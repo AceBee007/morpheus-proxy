@@ -86,8 +86,8 @@ export function startConnectListener(runtime: ConnectRuntime): Promise<StartedLi
           listener: { ...listener, upstream: `h2c://${authority}` },
         };
         const server = http2.createServer();
-        server.on('stream', (stream, headers) => {
-          handleHttpExchange(connRuntime, h2Exchange(stream, headers)).catch((err: unknown) => {
+        server.on('stream', (stream, headers, _flags, rawHeaders) => {
+          handleHttpExchange(connRuntime, h2Exchange(stream, headers, rawHeaders)).catch((err: unknown) => {
             appLog.error('connect h2 handler error', { error: String(err) });
             if (!stream.headersSent && !stream.destroyed) {
               try {
