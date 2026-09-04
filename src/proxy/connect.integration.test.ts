@@ -504,6 +504,54 @@ describe('CONNECT-inspect listener — descriptors imported via server reflectio
     expect(descriptors.hasService('grpc.reflection.v1.ServerReflection')).toBe(false);
   });
 
+  it('records observed upstreams with auto off, so a one-shot import can fetch them later', async () => {
+    const upstream = await startReflectionUpstream({
+      protoSource: GRPC_PROTO,
+      serviceName: 'demo.TimeService',
+      handlers: {
+        Now: (
+          _call: grpc.ServerUnaryCall<{ tz: string }, NowResponse>,
+          callback: grpc.sendUnaryData<NowResponse>,
+        ) => callback(null, { iso: 'x', source: 'real' }),
+      },
+    });
+    cleanups.push(() => upstream.close());
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: { ...defaultReflection(), auto: false },
+    });
+    const stack = await startConnect({ protocol: 'grpc', descriptors, reflection });
+    cleanups.push(() => stack.close());
+    savedProxy = process.env['grpc_proxy'];
+    process.env['grpc_proxy'] = `http://127.0.0.1:${stack.port}`;
+    const pkg = grpc.loadPackageDefinition(upstream.packageDefinition)['demo'] as grpc.GrpcObject;
+    const Ctor = pkg['TimeService'] as unknown as new (a: string, c: grpc.ChannelCredentials) => TimeClient;
+    const client = new Ctor(upstream.target, grpc.credentials.createInsecure());
+    cleanups.push(() => client.close());
+
+    await new Promise<void>((resolve) => {
+      client.Now({ tz: 'utc' }, new grpc.Metadata(), () => resolve());
+    });
+    await sleep(50);
+    // nothing fetched automatically, but the upstream and its unknown service were observed
+    expect(upstream.reflectionRequests).toHaveLength(0);
+    expect(reflection.status().observed).toEqual([
+      expect.objectContaining({
+        target: upstream.target,
+        unknownServices: ['demo.TimeService'],
+        covered: false,
+        imported: false,
+      }),
+    ]);
+
+    const result = await reflection.importObserved();
+    expect(result).toMatchObject({ imported: 1, failed: 0, skipped: 0 });
+    expect(descriptors.hasService('demo.TimeService')).toBe(true);
+    expect(reflection.status().observed[0]).toMatchObject({ imported: true, covered: true, unknownServices: [] });
+  });
+
   it('leaves traffic untouched when the upstream has no reflection (negative cache, no retry storm)', async () => {
     const upstream = await startReflectionUpstream({
       protoSource: GRPC_PROTO,

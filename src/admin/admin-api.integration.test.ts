@@ -760,11 +760,62 @@ message NowResponse { string iso = 1; }
     expect(status.failures).toEqual([expect.objectContaining({ target: '127.0.0.1:1', reason: 'unavailable' })]);
   });
 
+  it('imports every observed upstream in one shot', async () => {
+    const reflected = await startReflectionUpstream({
+      protoSource: REFLECTED_PROTO,
+      serviceName: 'demo.TimeService',
+      handlers: { Now: (_call: unknown, cb: (e: null, r: unknown) => void) => cb(null, { iso: 'x' }) },
+    });
+    cleanups.push(() => Promise.resolve(reflected.close()));
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: defaultReflection(),
+    });
+    // what the gRPC listener records for every forwarded call
+    reflection.observe(reflected.target, 'demo.TimeService', false);
+    reflection.observe('127.0.0.1:1', 'other.Svc', false);
+    const stack = await startTestStack({ upstream: upstream.url, descriptors, reflection });
+    cleanups.push(() => stack.close());
+
+    const before = (await (await stack.api('/api/v1/grpc/reflection')).json()) as {
+      observed: Array<{ target: string; unknownServices: string[]; covered: boolean }>;
+    };
+    expect(before.observed).toHaveLength(2);
+    expect(before.observed.find((o) => o.target === reflected.target)).toMatchObject({
+      unknownServices: ['demo.TimeService'],
+      covered: false,
+    });
+
+    const res = await stack.api('/api/v1/grpc/descriptors:reflect-all', json({}));
+    expect(res.status).toBe(200);
+    const result = (await res.json()) as {
+      imported: number;
+      failed: number;
+      skipped: number;
+      targets: Array<{ target: string; status: string; reason?: string }>;
+    };
+    expect(result).toMatchObject({ imported: 1, failed: 1, skipped: 0 });
+    expect(result.targets.find((t) => t.target === reflected.target)?.status).toBe('imported');
+    expect(result.targets.find((t) => t.target === '127.0.0.1:1')).toMatchObject({
+      status: 'failed',
+      reason: 'unavailable',
+    });
+    expect(descriptors.hasService('demo.TimeService')).toBe(true);
+
+    const bad = await stack.api('/api/v1/grpc/descriptors:reflect-all', json({ onlyMissing: 'yes' }));
+    expect(bad.status).toBe(400);
+  });
+
   it('answers 400 when the process has no reflection importer', async () => {
     const { stack } = await setup();
     const res = await stack.api('/api/v1/grpc/descriptors:reflect', json({ target: '127.0.0.1:1' }));
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe('reflection_unavailable');
     expect((await stack.api('/api/v1/grpc/reflection')).status).toBe(400);
+    expect((await stack.api('/api/v1/grpc/descriptors:reflect-all', json({}))).status).toBe(400);
   });
 });

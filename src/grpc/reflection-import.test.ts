@@ -295,3 +295,92 @@ describe('ReflectionImporter.scheduleStartupImport', () => {
     expect(fetcher).toHaveBeenCalledTimes(3); // only the first attempt of the second importer
   });
 });
+
+describe('ReflectionImporter — observed upstreams and one-shot import', () => {
+  const OTHER_PROTO = `syntax = "proto3";
+package other;
+service Svc { rpc Get (Req) returns (Res); }
+message Req { string id = 1; }
+message Res { string name = 1; }
+`;
+
+  it('records observed targets with known / unknown services', () => {
+    const h = harness();
+    h.registry.add({ name: 'other', format: 'proto_source', content: OTHER_PROTO });
+    h.importer.observe(TARGET, 't.Svc', false);
+    h.importer.observe(TARGET, 't.Svc', false);
+    h.importer.observe('10.0.0.9:50051', 'other.Svc', true);
+    h.importer.noteConfiguredUpstream('cfg:5000');
+    const observed = h.importer.status().observed;
+    expect(observed.map((o) => o.target).sort()).toEqual([TARGET, '10.0.0.9:50051', 'cfg:5000'].sort());
+    const main = observed.find((o) => o.target === TARGET);
+    expect(main).toMatchObject({ requests: 2, unknownServices: ['t.Svc'], services: [], imported: false, covered: false, configured: false });
+    const other = observed.find((o) => o.target === '10.0.0.9:50051');
+    expect(other).toMatchObject({ requests: 1, services: ['other.Svc'], unknownServices: [], covered: true });
+    const cfg = observed.find((o) => o.target === 'cfg:5000');
+    expect(cfg).toMatchObject({ configured: true, requests: 0, covered: false });
+  });
+
+  it('imports only targets with missing descriptors, skipping covered and disallowed ones', async () => {
+    const h = harness({ allow: ['127.0.0.1:*', 'covered:*'] });
+    h.registry.add({ name: 'other', format: 'proto_source', content: OTHER_PROTO });
+    h.importer.observe(TARGET, 't.Svc', false); // missing -> import
+    h.importer.observe('10.0.0.9:50051', 't.Svc', false); // not allowed
+    h.importer.observe('covered:1', 'other.Svc', true); // covered (descriptor present) -> skipped
+    const result = await h.importer.importObserved();
+    expect(result).toMatchObject({ imported: 1, failed: 0, skipped: 2 });
+    expect(result.targets.find((t) => t.target === TARGET)).toMatchObject({
+      status: 'imported',
+      services: ['t.Svc'],
+      missing: [],
+    });
+    expect(result.targets.find((t) => t.target === '10.0.0.9:50051')).toMatchObject({
+      status: 'skipped',
+      skippedBecause: 'not_allowed',
+    });
+    expect(result.targets.find((t) => t.target === 'covered:1')).toMatchObject({
+      status: 'skipped',
+      skippedBecause: 'covered',
+    });
+    expect(h.fetcher).toHaveBeenCalledTimes(1);
+    // the imported target is now covered and imported
+    const observed = h.importer.status().observed.find((o) => o.target === TARGET);
+    expect(observed).toMatchObject({ imported: true, covered: true, unknownServices: [], services: ['t.Svc'] });
+    // a second one-shot with onlyMissing finds nothing to do
+    expect(await h.importer.importObserved()).toMatchObject({ imported: 0, skipped: 3 });
+    // deleting the descriptor by hand makes the target show its missing services again
+    h.registry.removeWhere((d) => d.source.type === 'reflection' && d.source.target === TARGET);
+    expect(h.importer.status().observed.find((o) => o.target === TARGET)).toMatchObject({
+      imported: false,
+      covered: false,
+      unknownServices: ['t.Svc'],
+    });
+    expect(await h.importer.importObserved()).toMatchObject({ imported: 1 });
+    // onlyMissing:false re-imports every allowed target
+    expect(await h.importer.importObserved({ onlyMissing: false })).toMatchObject({ imported: 2, skipped: 1 });
+  });
+
+  it('reports per-target failures without throwing', async () => {
+    const fetcher = vi.fn<ReflectionFetcher>((opts) =>
+      opts.target === 'down:1'
+        ? Promise.reject(new ReflectionError('unavailable', opts.target, 'refused'))
+        : Promise.resolve({
+            target: opts.target,
+            protocol: 'grpc-v1',
+            services: ['t.Svc'],
+            missing: [],
+            files: ['t.proto'],
+            descriptorSet: SET,
+          }),
+    );
+    const h = harness({}, fetcher);
+    h.importer.observe('down:1', 'x.Svc', false);
+    h.importer.observe(TARGET, 't.Svc', false);
+    const result = await h.importer.importObserved();
+    expect(result).toMatchObject({ imported: 1, failed: 1, skipped: 0 });
+    expect(result.targets.find((t) => t.target === 'down:1')).toMatchObject({
+      status: 'failed',
+      reason: 'unavailable',
+    });
+  });
+});
