@@ -109,7 +109,12 @@ export interface ReflectionImporterOptions {
   now?: () => number;
 }
 
-/** Retry delays for descriptors declared in config whose upstream is not up yet. */
+/**
+ * Retry schedule for descriptors declared in config whose upstream is not up
+ * yet: 1s, 2s, 4s, 8s, 16s, then 30s between attempts, at most 10 attempts in
+ * total (about 2.5 minutes). The limit is fixed by spec 4.7.6, not configurable;
+ * after giving up, auto / one-shot / explicit imports remain available.
+ */
 const STARTUP_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
 const DEFAULT_STARTUP_ATTEMPTS = 10;
 

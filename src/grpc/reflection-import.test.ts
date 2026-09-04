@@ -272,6 +272,33 @@ describe('ReflectionImporter.scheduleStartupImport', () => {
     h.importer.close();
   });
 
+  it('gives up after exactly 10 attempts (~2.5 minutes) by default (spec 4.7.6)', async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn<ReflectionFetcher>((opts) =>
+      Promise.reject(new ReflectionError('unavailable', opts.target, 'never up')),
+    );
+    const h = harness({}, fetcher);
+    const error = vi.spyOn(h.logger, 'error');
+    h.importer.scheduleStartupImport(TARGET);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // 1s, 2s, 4s, 8s, 16s, then 30s between the remaining attempts
+    const schedule = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000, 30_000];
+    for (const [i, delay] of schedule.entries()) {
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(fetcher).toHaveBeenCalledTimes(i + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetcher).toHaveBeenCalledTimes(i + 2);
+    }
+    expect(fetcher).toHaveBeenCalledTimes(10);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0]?.[1]).toMatchObject({ target: TARGET, attempts: 10 });
+    // nothing more, ever
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(fetcher).toHaveBeenCalledTimes(10);
+    expect(schedule.reduce((a, b) => a + b, 0)).toBe(151_000);
+  });
+
   it('gives up after maxAttempts and stops retrying once closed', async () => {
     vi.useFakeTimers();
     const fetcher = vi.fn<ReflectionFetcher>((opts) =>
