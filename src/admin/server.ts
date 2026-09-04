@@ -4,6 +4,8 @@ import type { AddressInfo } from 'node:net';
 import { extname, join, normalize } from 'node:path';
 import type { MorpheusConfig } from '../config/types.js';
 import { DescriptorError, type DescriptorRegistry } from '../grpc/descriptors.js';
+import type { ReflectionImporter } from '../grpc/reflection-import.js';
+import { ReflectionError } from '../grpc/reflection.js';
 import type { AppLogger } from '../logging/app-log.js';
 import type { MaskRegistry } from '../logging/mask.js';
 import type { TrafficLogStore } from '../logging/traffic-log.js';
@@ -44,6 +46,8 @@ export interface AdminContext {
   startedAt: Date;
   validateOptions: ValidateRuleOptions;
   descriptors: DescriptorRegistry;
+  /** Server reflection imports (spec 4.7.6); absent when the process has no importer. */
+  reflection?: ReflectionImporter;
   scriptRunner?: ScriptMatcherRunner;
   manipulatorRunner?: ManipulatorRunner;
   scriptSandboxStatus?: () => unknown;
@@ -372,6 +376,101 @@ function buildRoutes(): Route[] {
           }
           throw err;
         }
+      },
+    },
+    {
+      // Import descriptors from an upstream via gRPC server reflection (spec 4.7.6)
+      method: 'POST',
+      path: '/api/v1/grpc/descriptors:reflect',
+      handler: async ({ req, res, ctx }) => {
+        const importer = ctx.reflection;
+        if (!importer) {
+          throw new ApiError(400, 'reflection_unavailable', 'reflection import is not enabled');
+        }
+        const body = await readJsonBody(req);
+        if (
+          typeof body !== 'object' ||
+          body === null ||
+          typeof (body as Record<string, unknown>)['target'] !== 'string' ||
+          (body as Record<string, unknown>)['target'] === ''
+        ) {
+          throw new ApiError(400, 'invalid_reflection_request', 'body must contain target (host:port)');
+        }
+        const record = body as { target: string; symbols?: unknown; timeoutMs?: unknown };
+        let symbols: string[] | undefined;
+        if (record.symbols !== undefined) {
+          if (!Array.isArray(record.symbols) || !record.symbols.every((s) => typeof s === 'string')) {
+            throw new ApiError(400, 'invalid_reflection_request', 'symbols must be an array of strings');
+          }
+          symbols = record.symbols;
+        }
+        let timeoutMs: number | undefined;
+        if (record.timeoutMs !== undefined) {
+          if (!Number.isInteger(record.timeoutMs) || (record.timeoutMs as number) <= 0) {
+            throw new ApiError(400, 'invalid_reflection_request', 'timeoutMs must be a positive integer');
+          }
+          timeoutMs = record.timeoutMs as number;
+        }
+        try {
+          const info = await importer.import(
+            record.target,
+            symbols,
+            timeoutMs !== undefined ? { timeoutMs } : {},
+          );
+          sendJson(res, 201, info);
+        } catch (err) {
+          if (err instanceof ReflectionError) {
+            throw new ApiError(
+              err.reason === 'invalid_target' ? 400 : 502,
+              'reflection_failed',
+              err.message,
+              [{ reason: err.reason, message: err.message }],
+            );
+          }
+          throw err;
+        }
+      },
+    },
+    {
+      // One-shot import from every observed / configured upstream (spec 4.7.6)
+      method: 'POST',
+      path: '/api/v1/grpc/descriptors:reflect-all',
+      handler: async ({ req, res, ctx }) => {
+        const importer = ctx.reflection;
+        if (!importer) {
+          throw new ApiError(400, 'reflection_unavailable', 'reflection import is not enabled');
+        }
+        const body = await readJsonBody(req);
+        let onlyMissing = true;
+        if (body !== undefined) {
+          if (typeof body !== 'object' || body === null) {
+            throw new ApiError(400, 'invalid_reflection_request', 'body must be a JSON object');
+          }
+          const flag = (body as Record<string, unknown>)['onlyMissing'];
+          if (flag !== undefined) {
+            if (typeof flag !== 'boolean') {
+              throw new ApiError(400, 'invalid_reflection_request', 'onlyMissing must be a boolean');
+            }
+            onlyMissing = flag;
+          }
+        }
+        const result = await importer.importObserved({ onlyMissing });
+        ctx.appLog.info('reflection import of observed upstreams finished', {
+          imported: result.imported,
+          failed: result.failed,
+          skipped: result.skipped,
+        });
+        sendJson(res, 200, result);
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/v1/grpc/reflection',
+      handler: ({ res, ctx }) => {
+        if (!ctx.reflection) {
+          throw new ApiError(400, 'reflection_unavailable', 'reflection import is not enabled');
+        }
+        sendJson(res, 200, ctx.reflection.status());
       },
     },
     {

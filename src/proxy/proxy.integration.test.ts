@@ -706,7 +706,11 @@ describe('HTTP attempt logging is guaranteed exactly once (client_aborted)', () 
     session.on('error', () => {});
 
     const abortPartial = async (): Promise<void> => {
-      const req = session.request({ ':method': 'POST', ':path': '/partial' });
+      // A partial request: the client declares 64 bytes, sends 23, then gives up.
+      // Node half-closes the stream (END_STREAM) before the RST_STREAM(CANCEL)
+      // reaches the proxy, so the proxy must recognise the short body from
+      // content-length rather than from the timing of the reset.
+      const req = session.request({ ':method': 'POST', ':path': '/partial', 'content-length': '64' });
       req.on('error', () => {});
       req.write('incomplete request body');
       await sleep(20);

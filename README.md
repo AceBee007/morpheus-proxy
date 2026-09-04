@@ -28,7 +28,9 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 - Request stage: `mock_response`, `fault`, `request_rewrite`, delay
 - Response stage: `fault`, `response_replace` (header regex), `script_manipulator`, delay
 - Consumable rules (`times`, `resetAfterMs`): apply N times, then fall through
-- gRPC descriptor registry for message decode / mock / manipulation
+- gRPC descriptor registry for message decode / mock / manipulation; descriptors
+  can be imported from the upstream itself via gRPC server reflection (v1 with
+  v1alpha fallback) — explicitly, at startup, or on demand
 - Traffic log with body capture, masking, retention, and SSE streaming
 - Simulation of rules against stored logs or sample requests
 - Import / export of rules (rules live in memory only)

@@ -8,6 +8,7 @@ import { defaultConfig } from '../config/defaults.js';
 import type { LimitsConfig, ListenerConfig, MorpheusConfig } from '../config/types.js';
 import { DescriptorRegistry } from '../grpc/descriptors.js';
 import { startGrpcListener } from '../grpc/grpc-listener.js';
+import type { ReflectionImporter } from '../grpc/reflection-import.js';
 import { grpcBodyValidatorFor } from '../grpc/rule-validation.js';
 import { nullLogger } from '../logging/app-log.js';
 import { MaskRegistry } from '../logging/mask.js';
@@ -96,6 +97,8 @@ export interface TestProxyOptions {
   protocol?: 'http' | 'grpc';
   /** Pre-registered descriptors for gRPC stacks. */
   descriptors?: DescriptorRegistry;
+  /** Reflection importer shared by the gRPC listener and the admin API (spec 4.7.6). */
+  reflection?: ReflectionImporter;
 }
 
 export interface TestProxy {
@@ -171,7 +174,11 @@ export async function startTestProxy(opts: TestProxyOptions): Promise<TestProxy>
 
   const listener =
     protocol === 'grpc'
-      ? await startGrpcListener({ ...runtime, descriptors })
+      ? await startGrpcListener({
+          ...runtime,
+          descriptors,
+          ...(opts.reflection ? { reflection: opts.reflection } : {}),
+        })
       : await startHttpListener(runtime);
   return {
     port: listener.port,
@@ -217,6 +224,7 @@ export async function startTestStack(
     appLog: nullLogger(),
     metrics: proxy.metrics,
     descriptors: proxy.descriptors,
+    ...(opts.reflection ? { reflection: opts.reflection } : {}),
     listeners: () => [proxy.listener],
     ready: opts.ready ?? (() => true),
     startedAt: new Date(),

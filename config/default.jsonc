@@ -66,6 +66,26 @@
     "upstreamTimeoutMs": 30000,
     "idleTimeoutMs": 60000
   },
+  // gRPC server reflection (spec 4.7.6): morpheus can fetch descriptors from an
+  // upstream itself (grpc.reflection.v1, falling back to v1alpha) instead of
+  // requiring a descriptor set upload. Explicit imports use the admin API
+  // (POST /_morpheus/api/v1/grpc/descriptors:reflect) or a listener's
+  // "descriptors": [{ "reflect": "host:port" }] entry; "auto" imports on demand.
+  "reflection": {
+    // Import descriptors when a gRPC method without a descriptor is seen. The
+    // triggering request is still relayed as-is; later requests are decoded.
+    "auto": false,
+    // Glob patterns ("*" wildcard) of upstream authorities that may be queried.
+    "allow": ["*"],
+    // Deadline per reflection RPC.
+    "timeoutMs": 3000,
+    // A failed target is not retried automatically before this much time passed.
+    "negativeTtlMs": 60000,
+    // Upper bound on the descriptor bytes accepted from one target (16 MiB).
+    "maxBytes": 16777216,
+    // Extra request metadata for the reflection calls, e.g. credentials.
+    "metadata": {}
+  },
   "logging": {
     "trafficLogDir": "logs/morpheus-proxy/traffic",
     "appLogDir": "logs/morpheus-proxy/app",

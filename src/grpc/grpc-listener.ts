@@ -25,10 +25,29 @@ import {
 } from '../rules/matcher.js';
 import type { Rule } from '../rules/types.js';
 import type { DescriptorRegistry, ResolvedMethod } from './descriptors.js';
-import { decodeGrpcFrames, encodeGrpcFrame, encodeGrpcMessage } from './frames.js';
+import {
+  decodeGrpcFrames,
+  encodeGrpcFrame,
+  encodeGrpcMessage,
+  GrpcFrameError,
+  type GrpcFrame,
+} from './frames.js';
+import { serviceOfPath, type ReflectionImporter } from './reflection-import.js';
 
 export interface GrpcRuntime extends ProxyRuntime {
   descriptors: DescriptorRegistry;
+  /** On-demand descriptor import via server reflection (spec 4.7.6). */
+  reflection?: ReflectionImporter;
+}
+
+/** `host:port` of the listener's upstream (the CONNECT authority or the reverse upstream). */
+function upstreamAuthority(upstream: string): string | null {
+  try {
+    const target = parseUpstream(upstream);
+    return `${target.host}:${target.port}`;
+  } catch {
+    return null;
+  }
 }
 
 const GRPC_STATUS = {
@@ -238,6 +257,72 @@ function upstreamFailureResponse(err: unknown): { status: number; message: strin
   return { status: GRPC_STATUS.UNAVAILABLE, message: `upstream unavailable: ${message}` };
 }
 
+/**
+ * A unary request whose body never became usable (stream aborted before the
+ * body completed, or it ended inside a gRPC frame). Rule ordering and
+ * consumption still apply: body-independent matchers are evaluated exactly as
+ * for any streaming request, so an exhausted intercept falls through to a later
+ * capture, and the attempt is logged once as client_aborted (spec 4.9).
+ */
+async function logAbortedUnaryRequest(
+  runtime: GrpcRuntime,
+  ctx: StreamContext,
+  grpcPath: { service?: string; method?: string },
+): Promise<void> {
+  const { stream, path, metadata } = ctx;
+  stream.destroy();
+  const snapshot = runtime.ruleStore.snapshot();
+  const evaluation = await evaluateRequest({
+    rules: snapshot.rules,
+    protocol: 'grpc',
+    request: {
+      id: randomUUID(),
+      method: 'POST',
+      host: ctx.authority,
+      path,
+      query: '',
+      headers: metadata,
+      grpc: {
+        ...(grpcPath.service !== undefined ? { service: grpcPath.service } : {}),
+        ...(grpcPath.method !== undefined ? { method: grpcPath.method } : {}),
+        metadata,
+      },
+    },
+    consume: runtime.consume,
+    ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
+    streaming: true,
+  });
+  const shouldLog =
+    evaluation.interceptRule !== null ||
+    evaluation.captureRules.length > 0 ||
+    evaluation.errors.length > 0;
+  runtime.metrics?.recordRequest(
+    shouldLog ? 'client_aborted' : 'passthrough',
+    evaluation.matched.map((m) => m.id),
+    undefined,
+  );
+  for (let i = 0; i < evaluation.errors.length; i++) runtime.metrics?.recordScriptError();
+  if (!shouldLog) return;
+  try {
+    runtime.trafficLog.add({
+      startedAt: ctx.startedAt,
+      endedAt: (runtime.now ?? (() => new Date()))(),
+      protocol: 'grpc',
+      listener: runtime.listener.name,
+      client: ctx.client,
+      target: runtime.listener.upstream,
+      request: { method: 'POST', path, headers: metadata, bodySkippedReason: 'client_aborted' },
+      response: { headers: {}, bodySkippedReason: 'client_aborted' },
+      outcome: 'client_aborted',
+      loggingReason: 'client_aborted',
+      matchedRules: evaluation.matched,
+      ruleErrors: evaluation.errors,
+    });
+  } catch (err) {
+    runtime.appLog.error('traffic log write failed', { error: String(err) });
+  }
+}
+
 async function handleUnary(
   runtime: GrpcRuntime,
   ctx: StreamContext,
@@ -249,60 +334,7 @@ async function handleUnary(
 
   const read = await readBodyUpTo(stream as unknown as Readable, limit).catch(() => null);
   if (read === null) {
-    // The body is incomplete, but rule ordering and consumption still apply:
-    // body-independent matchers are evaluated exactly as for any streaming
-    // request, so an exhausted intercept falls through to a later capture.
-    stream.destroy();
-    const snapshot = runtime.ruleStore.snapshot();
-    const evaluation = await evaluateRequest({
-      rules: snapshot.rules,
-      protocol: 'grpc',
-      request: {
-        id: randomUUID(),
-        method: 'POST',
-        host: ctx.authority,
-        path,
-        query: '',
-        headers: metadata,
-        grpc: {
-          ...(grpcPath.service !== undefined ? { service: grpcPath.service } : {}),
-          ...(grpcPath.method !== undefined ? { method: grpcPath.method } : {}),
-          metadata,
-        },
-      },
-      consume: runtime.consume,
-      ...(runtime.scriptRunner ? { scriptRunner: runtime.scriptRunner } : {}),
-      streaming: true,
-    });
-    const shouldLog =
-      evaluation.interceptRule !== null ||
-      evaluation.captureRules.length > 0 ||
-      evaluation.errors.length > 0;
-    runtime.metrics?.recordRequest(
-      shouldLog ? 'client_aborted' : 'passthrough',
-      evaluation.matched.map((m) => m.id),
-      undefined,
-    );
-    for (let i = 0; i < evaluation.errors.length; i++) runtime.metrics?.recordScriptError();
-    if (!shouldLog) return;
-    try {
-      runtime.trafficLog.add({
-        startedAt: ctx.startedAt,
-        endedAt: (runtime.now ?? (() => new Date()))(),
-        protocol: 'grpc',
-        listener: runtime.listener.name,
-        client: ctx.client,
-        target: runtime.listener.upstream,
-        request: { method: 'POST', path, headers: metadata, bodySkippedReason: 'client_aborted' },
-        response: { headers: {}, bodySkippedReason: 'client_aborted' },
-        outcome: 'client_aborted',
-        loggingReason: 'client_aborted',
-        matchedRules: evaluation.matched,
-        ruleErrors: evaluation.errors,
-      });
-    } catch (err) {
-      runtime.appLog.error('traffic log write failed', { error: String(err) });
-    }
+    await logAbortedUnaryRequest(runtime, ctx, grpcPath);
     return;
   }
   if (!read.complete) {
@@ -314,10 +346,24 @@ async function handleUnary(
   }
   const rawBody = read.buffer;
 
+  // The stream ended inside a gRPC frame: the client gave up mid-message (a
+  // half-close followed by RST_STREAM looks exactly like this). Nothing usable
+  // can be forwarded, so it is a client abort — decided from the bytes, not
+  // from the timing of the trailing reset.
+  let frames: GrpcFrame[];
+  try {
+    frames = decodeGrpcFrames(rawBody);
+  } catch (err) {
+    if (err instanceof GrpcFrameError) {
+      await logAbortedUnaryRequest(runtime, ctx, grpcPath);
+      return;
+    }
+    throw err;
+  }
+
   // decode request messages when the descriptor covers them (spec 4.7.3)
   let requestMessages: unknown[] | undefined;
   try {
-    const frames = decodeGrpcFrames(rawBody);
     if (frames.every((f) => !f.compressed)) {
       requestMessages = frames.map((f) =>
         runtime.descriptors.decodeMessage(method.requestType, f.message),
@@ -1269,6 +1315,21 @@ export function grpcStreamHandler(
       startedAt: (runtime.now ?? (() => new Date()))(),
       method: runtime.descriptors.lookupMethod(String(headers[':path'] ?? '/')),
     };
+    if (runtime.reflection) {
+      const target = upstreamAuthority(runtime.listener.upstream);
+      if (target !== null) {
+        // Remember the upstream for the one-shot import of observed targets
+        // (independent of reflection.auto), then — for an unknown method — import
+        // its descriptors in the background so later calls are decoded; this
+        // call is relayed as before (spec 4.7.6).
+        runtime.reflection.observe(
+          target,
+          ctx.method?.service ?? serviceOfPath(ctx.path),
+          ctx.method !== null,
+        );
+        if (ctx.method === null) runtime.reflection.ensure(target, ctx.path);
+      }
+    }
     handleGrpcStream(runtime, ctx).catch((err: unknown) => {
       appLog.error('grpc handler error', { path: ctx.path, error: String(err) });
       if (!stream.headersSent && !stream.destroyed) {
