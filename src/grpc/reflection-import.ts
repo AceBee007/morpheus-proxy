@@ -36,15 +36,66 @@ export interface ReflectionImportRecord {
   at: string;
 }
 
+/** An upstream the proxy has forwarded gRPC calls to (or a configured reverse upstream). */
+export interface ObservedTarget {
+  target: string;
+  /** Declared as a reverse listener upstream in config (may have no traffic yet). */
+  configured: boolean;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  requests: number;
+  /** Services seen on this target that have a descriptor. */
+  services: string[];
+  /** Services seen on this target that still have no descriptor. */
+  unknownServices: string[];
+  /** Descriptors were imported from this target via reflection. */
+  imported: boolean;
+  /** Every observed service has a descriptor (nothing left to fetch). */
+  covered: boolean;
+}
+
+export interface ReflectAllTargetResult {
+  target: string;
+  status: 'imported' | 'failed' | 'skipped';
+  descriptorId?: string;
+  services?: string[];
+  missing?: string[];
+  reason?: ReflectionFailureReason;
+  message?: string;
+  skippedBecause?: 'covered' | 'not_allowed';
+}
+
+export interface ReflectAllResult {
+  targets: ReflectAllTargetResult[];
+  imported: number;
+  failed: number;
+  skipped: number;
+}
+
 export interface ReflectionStatus {
   auto: boolean;
   allow: string[];
   inFlight: string[];
   imports: ReflectionImportRecord[];
   failures: ReflectionFailure[];
+  /** Upstreams seen in traffic / configured, most recently seen first. */
+  observed: ObservedTarget[];
   /** service full name -> authority it was last seen on (for diagnostics / rule hints). */
   lastSeen: Record<string, string>;
 }
+
+interface ObservedEntry {
+  configured: boolean;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  requests: number;
+  services: Set<string>;
+  unknownServices: Set<string>;
+}
+
+/** Bounds on what is remembered about observed upstreams (spec 4.11 style limits). */
+const MAX_OBSERVED_TARGETS = 200;
+const MAX_SERVICES_PER_TARGET = 500;
 
 export type ReflectionFetcher = (opts: ReflectionFetchOptions) => Promise<ReflectionFetchResult>;
 
@@ -90,6 +141,7 @@ export class ReflectionImporter {
   /** `target|service` pairs confirmed absent from that target, with expiry (epoch ms). */
   private readonly unknownServices = new Map<string, number>();
   private readonly lastSeen = new Map<string, string>();
+  private readonly observed = new Map<string, ObservedEntry>();
   private readonly warnedDisallowed = new Set<string>();
   private readonly timers = new Set<NodeJS.Timeout>();
   private closed = false;
@@ -265,6 +317,125 @@ export class ReflectionImporter {
       });
   }
 
+  /**
+   * Records that a gRPC call for `service` was forwarded to `target`, whether
+   * or not a descriptor covered it. This is independent of `reflection.auto`
+   * and feeds the one-shot import of observed upstreams (spec 4.7.6).
+   */
+  observe(target: string, service: string | null, known: boolean): void {
+    const entry = this.entryFor(target, false);
+    if (entry === null) return;
+    const now = this.now();
+    entry.lastSeenAt = now;
+    entry.requests += 1;
+    if (service === null || service === '') return;
+    if (known) {
+      entry.unknownServices.delete(service);
+      if (entry.services.size < MAX_SERVICES_PER_TARGET) entry.services.add(service);
+      this.lastSeen.set(service, target);
+    } else if (entry.unknownServices.size < MAX_SERVICES_PER_TARGET) {
+      entry.unknownServices.add(service);
+    }
+  }
+
+  /** Registers a reverse listener's fixed upstream so it can be imported before any traffic. */
+  noteConfiguredUpstream(target: string): void {
+    const entry = this.entryFor(target, true);
+    if (entry !== null) entry.configured = true;
+  }
+
+  private entryFor(target: string, configured: boolean): ObservedEntry | null {
+    const existing = this.observed.get(target);
+    if (existing) return existing;
+    if (this.observed.size >= MAX_OBSERVED_TARGETS) {
+      // Evict the least recently seen target rather than growing without bound.
+      let oldest: [string, ObservedEntry] | undefined;
+      for (const candidate of this.observed) {
+        if (oldest === undefined || candidate[1].lastSeenAt < oldest[1].lastSeenAt) oldest = candidate;
+      }
+      if (oldest !== undefined) this.observed.delete(oldest[0]);
+    }
+    const now = this.now();
+    const entry: ObservedEntry = {
+      configured,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      requests: 0,
+      services: new Set(),
+      unknownServices: new Set(),
+    };
+    this.observed.set(target, entry);
+    return entry;
+  }
+
+  private observedTargets(): ObservedTarget[] {
+    return [...this.observed.entries()]
+      .sort((a, b) => b[1].lastSeenAt - a[1].lastSeenAt)
+      .map(([target, entry]) => {
+        // Coverage is evaluated against the registry as it is now, so descriptors
+        // deleted (or added by hand) after the traffic was seen are reflected.
+        const seen = [...new Set([...entry.services, ...entry.unknownServices])];
+        const services = seen.filter((s) => this.registry.hasService(s));
+        const unknownServices = seen.filter((s) => !this.registry.hasService(s));
+        const imported = this.registry
+          .list()
+          .some((d) => d.source.type === 'reflection' && d.source.target === target);
+        return {
+          target,
+          configured: entry.configured,
+          firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
+          lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
+          requests: entry.requests,
+          services,
+          unknownServices,
+          imported,
+          covered: unknownServices.length === 0 && (services.length > 0 || imported),
+        };
+      });
+  }
+
+  /**
+   * One-shot import from every observed / configured upstream (admin UI button,
+   * `POST /grpc/descriptors:reflect-all`). With `onlyMissing` (default) targets
+   * whose observed services all have descriptors are skipped; targets outside
+   * `reflection.allow` are always skipped. Never throws: each target reports
+   * its own outcome.
+   */
+  async importObserved(opts: { onlyMissing?: boolean } = {}): Promise<ReflectAllResult> {
+    const onlyMissing = opts.onlyMissing ?? true;
+    const targets = await Promise.all(
+      this.observedTargets().map(async (observed): Promise<ReflectAllTargetResult> => {
+        if (onlyMissing && observed.covered) {
+          return { target: observed.target, status: 'skipped', skippedBecause: 'covered' };
+        }
+        if (!this.isAllowed(observed.target)) {
+          return { target: observed.target, status: 'skipped', skippedBecause: 'not_allowed' };
+        }
+        try {
+          const info = await this.import(observed.target);
+          const record = this.imports.get(observed.target);
+          return {
+            target: observed.target,
+            status: 'imported',
+            descriptorId: info.id,
+            services: record?.services ?? [],
+            missing: record?.missing ?? [],
+          };
+        } catch (err) {
+          return {
+            target: observed.target,
+            status: 'failed',
+            reason: err instanceof ReflectionError ? err.reason : 'invalid',
+            message: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }),
+    );
+    const count = (status: ReflectAllTargetResult['status']): number =>
+      targets.filter((t) => t.status === status).length;
+    return { targets, imported: count('imported'), failed: count('failed'), skipped: count('skipped') };
+  }
+
   /** Remembers which authority served a known service (diagnostics, rule hints). */
   noteAuthority(service: string, target: string): void {
     this.lastSeen.set(service, target);
@@ -318,6 +489,7 @@ export class ReflectionImporter {
       inFlight: [...this.inFlight.keys()],
       imports: [...this.imports.values()],
       failures: [...this.failures.values()],
+      observed: this.observedTargets(),
       lastSeen: Object.fromEntries(this.lastSeen),
     };
   }

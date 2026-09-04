@@ -26,7 +26,7 @@ import {
 import type { Rule } from '../rules/types.js';
 import type { DescriptorRegistry, ResolvedMethod } from './descriptors.js';
 import { decodeGrpcFrames, encodeGrpcFrame, encodeGrpcMessage } from './frames.js';
-import type { ReflectionImporter } from './reflection-import.js';
+import { serviceOfPath, type ReflectionImporter } from './reflection-import.js';
 
 export interface GrpcRuntime extends ProxyRuntime {
   descriptors: DescriptorRegistry;
@@ -1283,12 +1283,18 @@ export function grpcStreamHandler(
       method: runtime.descriptors.lookupMethod(String(headers[':path'] ?? '/')),
     };
     if (runtime.reflection) {
-      // Unknown method: import the upstream's descriptors in the background so
-      // later calls are decoded; this call is relayed as before (spec 4.7.6).
       const target = upstreamAuthority(runtime.listener.upstream);
       if (target !== null) {
+        // Remember the upstream for the one-shot import of observed targets
+        // (independent of reflection.auto), then — for an unknown method — import
+        // its descriptors in the background so later calls are decoded; this
+        // call is relayed as before (spec 4.7.6).
+        runtime.reflection.observe(
+          target,
+          ctx.method?.service ?? serviceOfPath(ctx.path),
+          ctx.method !== null,
+        );
         if (ctx.method === null) runtime.reflection.ensure(target, ctx.path);
-        else runtime.reflection.noteAuthority(ctx.method.service, target);
       }
     }
     handleGrpcStream(runtime, ctx).catch((err: unknown) => {

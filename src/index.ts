@@ -18,6 +18,7 @@ import { TrafficLogStore } from './logging/traffic-log.js';
 import { MetricsRegistry } from './observability/metrics.js';
 import { startConnectListener } from './proxy/connect-listener.js';
 import { startHttpListener, type StartedListener } from './proxy/http-listener.js';
+import { parseUpstream } from './proxy/upstream.js';
 import { startRetentionLoop } from './retention.js';
 import { ConsumeRegistry } from './rules/consume.js';
 import { RuleStore } from './rules/store.js';
@@ -61,6 +62,18 @@ async function main(): Promise<void> {
     scriptMaxTimeoutMs: config.script.maxTimeoutMs,
     grpcBodyValidator: grpcBodyValidatorFor(descriptors),
   };
+
+  // Reverse gRPC listeners have a fixed upstream: make it importable from the
+  // admin UI / API before any traffic has been seen (spec 4.7.6)
+  for (const listenerConfig of config.listeners) {
+    if (listenerConfig.protocol !== 'grpc' || listenerConfig.mode === 'connect') continue;
+    try {
+      const target = parseUpstream(listenerConfig.upstream);
+      reflection.noteConfiguredUpstream(`${target.host}:${target.port}`);
+    } catch {
+      // invalid upstreams are already reported by config validation
+    }
+  }
 
   // Descriptor sources referenced by listeners: unreadable files are skipped
   // with a warning and reflection imports retry in the background; startup

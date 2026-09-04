@@ -10,6 +10,30 @@ interface DescriptorInfo {
   services: Array<{ fullName: string; methods: Array<{ name: string; requestStream: boolean; responseStream: boolean }> }>;
 }
 
+interface ObservedTargetInfo {
+  target: string;
+  configured: boolean;
+  lastSeenAt: string;
+  requests: number;
+  services: string[];
+  unknownServices: string[];
+  imported: boolean;
+  covered: boolean;
+}
+
+interface ReflectionStatusInfo {
+  auto: boolean;
+  observed: ObservedTargetInfo[];
+  failures: Array<{ target: string; reason: string; message: string }>;
+}
+
+interface ReflectAllResultInfo {
+  imported: number;
+  failed: number;
+  skipped: number;
+  targets: Array<{ target: string; status: string; reason?: string; message?: string; missing?: string[] }>;
+}
+
 function sourceLabel(source: DescriptorInfo['source']): string {
   if (!source) return 'upload';
   if (source.type === 'reflection') return `reflection ${source.target ?? ''}${source.protocol ? ` (${source.protocol})` : ''}`;
@@ -27,6 +51,8 @@ export function Descriptors(): JSX.Element {
   const [reflectTarget, setReflectTarget] = useState('');
   const [reflectSymbols, setReflectSymbols] = useState('');
   const [reflecting, setReflecting] = useState(false);
+  const [status, setStatus] = useState<ReflectionStatusInfo | null>(null);
+  const [reflectingAll, setReflectingAll] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -34,6 +60,12 @@ export function Descriptors(): JSX.Element {
       setItems(data.items as unknown as DescriptorInfo[]);
     } catch (err) {
       toast('err', err instanceof Error ? err.message : String(err));
+    }
+    try {
+      setStatus((await api.reflectionStatus()) as unknown as ReflectionStatusInfo);
+    } catch {
+      // reflection import not enabled on this process: hide the observed-upstreams card
+      setStatus(null);
     }
   }, [toast]);
 
@@ -73,6 +105,25 @@ export function Descriptors(): JSX.Element {
     }
   };
 
+  const reflectAll = async (onlyMissing: boolean): Promise<void> => {
+    setReflectingAll(true);
+    try {
+      const result = (await api.reflectObserved({ onlyMissing })) as unknown as ReflectAllResultInfo;
+      const summary = `Imported ${result.imported}, failed ${result.failed}, skipped ${result.skipped}`;
+      const failures = result.targets.filter((t) => t.status === 'failed');
+      if (failures.length > 0) {
+        toast('err', `${summary} — ${failures.map((f) => `${f.target}: ${f.reason ?? 'error'}`).join('; ')}`);
+      } else {
+        toast('ok', summary);
+      }
+      await reload();
+    } catch (err) {
+      toast('err', err instanceof Error ? err.message : String(err));
+    } finally {
+      setReflectingAll(false);
+    }
+  };
+
   const remove = async (id: string): Promise<void> => {
     try {
       await api.deleteDescriptor(id);
@@ -89,6 +140,45 @@ export function Descriptors(): JSX.Element {
         gRPC body decode, matching, mock generation and manipulation require a registered
         descriptor. Without one, only metadata / path / grpc-status are available.
       </p>
+
+      {status !== null && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <h3 style={{ marginTop: 0 }}>Import from observed upstreams</h3>
+          <p className="muted" style={{ marginTop: 0 }}>
+            Upstreams this proxy has forwarded gRPC calls to (and configured reverse upstreams).
+            One click asks each of them for its own descriptors via server reflection; targets whose
+            services already have descriptors are skipped.
+            {status.auto ? ' Automatic import on first sight is on.' : ' Automatic import is off (reflection.auto).'}
+          </p>
+          {status.observed.length === 0 && (
+            <div className="muted">No gRPC upstream observed yet — send some traffic through the proxy first.</div>
+          )}
+          {status.observed.map((o) => (
+            <div key={o.target} className="row" style={{ padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+              <span className="mono">{o.target}</span>
+              <span className={`tag ${o.imported ? 'mock' : o.covered ? 'captured' : 'modified'}`}>
+                {o.imported ? 'imported' : o.covered ? 'covered' : 'missing descriptors'}
+              </span>
+              <span className="muted" style={{ fontSize: 12 }}>
+                {o.services.length + o.unknownServices.length} service(s), {o.requests} request(s)
+                {o.configured ? ', configured upstream' : ''}
+              </span>
+              {o.unknownServices.length > 0 && (
+                <span className="muted mono" style={{ fontSize: 11 }}>{o.unknownServices.join(', ')}</span>
+              )}
+            </div>
+          ))}
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="btn" onClick={() => void reflectAll(true)} disabled={reflectingAll || status.observed.length === 0}>
+              {reflectingAll ? 'Importing…' : 'Import missing descriptors'}
+            </button>
+            <button className="btn" onClick={() => void reflectAll(false)} disabled={reflectingAll || status.observed.length === 0}>
+              Re-import all
+            </button>
+            <button className="btn" onClick={() => void reload()} disabled={reflectingAll}>Refresh</button>
+          </div>
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Import via server reflection</h3>

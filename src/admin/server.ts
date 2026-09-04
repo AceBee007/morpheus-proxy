@@ -432,6 +432,38 @@ function buildRoutes(): Route[] {
       },
     },
     {
+      // One-shot import from every observed / configured upstream (spec 4.7.6)
+      method: 'POST',
+      path: '/api/v1/grpc/descriptors:reflect-all',
+      handler: async ({ req, res, ctx }) => {
+        const importer = ctx.reflection;
+        if (!importer) {
+          throw new ApiError(400, 'reflection_unavailable', 'reflection import is not enabled');
+        }
+        const body = await readJsonBody(req);
+        let onlyMissing = true;
+        if (body !== undefined) {
+          if (typeof body !== 'object' || body === null) {
+            throw new ApiError(400, 'invalid_reflection_request', 'body must be a JSON object');
+          }
+          const flag = (body as Record<string, unknown>)['onlyMissing'];
+          if (flag !== undefined) {
+            if (typeof flag !== 'boolean') {
+              throw new ApiError(400, 'invalid_reflection_request', 'onlyMissing must be a boolean');
+            }
+            onlyMissing = flag;
+          }
+        }
+        const result = await importer.importObserved({ onlyMissing });
+        ctx.appLog.info('reflection import of observed upstreams finished', {
+          imported: result.imported,
+          failed: result.failed,
+          skipped: result.skipped,
+        });
+        sendJson(res, 200, result);
+      },
+    },
+    {
       method: 'GET',
       path: '/api/v1/grpc/reflection',
       handler: ({ res, ctx }) => {
