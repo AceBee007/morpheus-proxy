@@ -76,7 +76,7 @@ export function grpcBodyValidatorFor(
       issues.push({
         path: 'match',
         reason: 'method_not_found',
-        message: `no registered descriptor covers ${target}`,
+        message: `no registered descriptor covers ${target}; upload one or import it from the upstream with POST /grpc/descriptors:reflect`,
       });
       return issues;
     }

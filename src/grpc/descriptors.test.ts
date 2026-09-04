@@ -102,3 +102,32 @@ service Svc { rpc Get (acme.Custom) returns (acme.Custom); }
     expect(registry.lookupMethod('not-a-grpc-path')).toBeNull();
   });
 });
+
+describe('DescriptorRegistry provenance and lookups (spec 4.7.6)', () => {
+  it('defaults the source to upload and keeps an explicit source', () => {
+    const registry = new DescriptorRegistry();
+    const uploaded = registry.add({ name: 'plain', format: 'proto_source', content: PLAIN_PROTO });
+    expect(uploaded.source).toEqual({ type: 'upload' });
+    const fromFile = registry.add({
+      name: 'file',
+      format: 'proto_source',
+      content: PLAIN_PROTO,
+      source: { type: 'file', path: '/etc/morpheus/t.proto' },
+    });
+    expect(fromFile.source).toEqual({ type: 'file', path: '/etc/morpheus/t.proto' });
+    expect(registry.list().map((d) => d.source.type)).toEqual(['upload', 'file']);
+  });
+
+  it('answers hasService and removes descriptors by predicate', () => {
+    const registry = new DescriptorRegistry();
+    expect(registry.hasService('t.Svc')).toBe(false);
+    const a = registry.add({ name: 'a', format: 'proto_source', content: PLAIN_PROTO });
+    const b = registry.add({ name: 'b', format: 'proto_source', content: WELL_KNOWN_PROTO });
+    expect(registry.hasService('t.Svc')).toBe(true);
+    expect(registry.hasService('demo.TimeService')).toBe(true);
+    expect(registry.hasService('t.Missing')).toBe(false);
+    expect(registry.removeWhere((info) => info.name === 'a')).toEqual([a.id]);
+    expect(registry.hasService('t.Svc')).toBe(false);
+    expect(registry.list().map((d) => d.id)).toEqual([b.id]);
+  });
+});

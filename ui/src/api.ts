@@ -168,6 +168,17 @@ export const api = {
     request<{ deleted: string }>(`/grpc/descriptors/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+  reflectDescriptors: (payload: { target: string; symbols?: string[] }) =>
+    request<Record<string, unknown>>('/grpc/descriptors:reflect', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  reflectObserved: (payload: { onlyMissing?: boolean }) =>
+    request<Record<string, unknown>>('/grpc/descriptors:reflect-all', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  reflectionStatus: () => request<Record<string, unknown>>('/grpc/reflection'),
 
   logEventsUrl: () => `${API}/logs/events`,
   logBodyUrl: (id: string, side: 'request' | 'response', variant?: string) =>

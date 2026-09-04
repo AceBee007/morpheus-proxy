@@ -20,6 +20,7 @@ import (
 
 	"morpheus-proxy/demo/internal/rpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -154,6 +155,7 @@ func main() {
 		}
 		grpcServer := grpc.NewServer()
 		rpc.RegisterEchoServer(grpcServer, server)
+		reflection.Register(grpcServer) // descriptors discoverable via server reflection (spec 4.7.6)
 		log.Printf("ms-a echo grpc listening on %s, time upstream %s, animal sound upstream %s, proxy %s", grpcAddr, timeAddr, animalSoundAddr, grpcProxyAddr)
 		errs <- grpcServer.Serve(listener)
 	}()

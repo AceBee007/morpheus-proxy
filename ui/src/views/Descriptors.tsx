@@ -6,7 +6,39 @@ interface DescriptorInfo {
   id: string;
   name: string;
   format: string;
+  source?: { type: string; target?: string; path?: string; protocol?: string; fetchedAt?: string };
   services: Array<{ fullName: string; methods: Array<{ name: string; requestStream: boolean; responseStream: boolean }> }>;
+}
+
+interface ObservedTargetInfo {
+  target: string;
+  configured: boolean;
+  lastSeenAt: string;
+  requests: number;
+  services: string[];
+  unknownServices: string[];
+  imported: boolean;
+  covered: boolean;
+}
+
+interface ReflectionStatusInfo {
+  auto: boolean;
+  observed: ObservedTargetInfo[];
+  failures: Array<{ target: string; reason: string; message: string }>;
+}
+
+interface ReflectAllResultInfo {
+  imported: number;
+  failed: number;
+  skipped: number;
+  targets: Array<{ target: string; status: string; reason?: string; message?: string; missing?: string[] }>;
+}
+
+function sourceLabel(source: DescriptorInfo['source']): string {
+  if (!source) return 'upload';
+  if (source.type === 'reflection') return `reflection ${source.target ?? ''}${source.protocol ? ` (${source.protocol})` : ''}`;
+  if (source.type === 'file') return `file ${source.path ?? ''}`;
+  return source.type;
 }
 
 export function Descriptors(): JSX.Element {
@@ -16,6 +48,11 @@ export function Descriptors(): JSX.Element {
   const [source, setSource] = useState(
     'syntax = "proto3";\npackage demo;\nservice TimeService {\n  rpc Now (NowRequest) returns (NowResponse);\n}\nmessage NowRequest { string tz = 1; }\nmessage NowResponse { string iso = 1; }\n',
   );
+  const [reflectTarget, setReflectTarget] = useState('');
+  const [reflectSymbols, setReflectSymbols] = useState('');
+  const [reflecting, setReflecting] = useState(false);
+  const [status, setStatus] = useState<ReflectionStatusInfo | null>(null);
+  const [reflectingAll, setReflectingAll] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -23,6 +60,12 @@ export function Descriptors(): JSX.Element {
       setItems(data.items as unknown as DescriptorInfo[]);
     } catch (err) {
       toast('err', err instanceof Error ? err.message : String(err));
+    }
+    try {
+      setStatus((await api.reflectionStatus()) as unknown as ReflectionStatusInfo);
+    } catch {
+      // reflection import not enabled on this process: hide the observed-upstreams card
+      setStatus(null);
     }
   }, [toast]);
 
@@ -37,6 +80,47 @@ export function Descriptors(): JSX.Element {
       await reload();
     } catch (err) {
       toast('err', err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const reflect = async (): Promise<void> => {
+    const target = reflectTarget.trim();
+    if (target === '') {
+      toast('err', 'Enter the upstream host:port to query');
+      return;
+    }
+    const symbols = reflectSymbols
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    setReflecting(true);
+    try {
+      const info = (await api.reflectDescriptors({ target, ...(symbols.length > 0 ? { symbols } : {}) })) as unknown as DescriptorInfo;
+      toast('ok', `Imported ${info.services.length} service(s) from ${target}`);
+      await reload();
+    } catch (err) {
+      toast('err', err instanceof Error ? err.message : String(err));
+    } finally {
+      setReflecting(false);
+    }
+  };
+
+  const reflectAll = async (onlyMissing: boolean): Promise<void> => {
+    setReflectingAll(true);
+    try {
+      const result = (await api.reflectObserved({ onlyMissing })) as unknown as ReflectAllResultInfo;
+      const summary = `Imported ${result.imported}, failed ${result.failed}, skipped ${result.skipped}`;
+      const failures = result.targets.filter((t) => t.status === 'failed');
+      if (failures.length > 0) {
+        toast('err', `${summary} — ${failures.map((f) => `${f.target}: ${f.reason ?? 'error'}`).join('; ')}`);
+      } else {
+        toast('ok', summary);
+      }
+      await reload();
+    } catch (err) {
+      toast('err', err instanceof Error ? err.message : String(err));
+    } finally {
+      setReflectingAll(false);
     }
   };
 
@@ -56,6 +140,74 @@ export function Descriptors(): JSX.Element {
         gRPC body decode, matching, mock generation and manipulation require a registered
         descriptor. Without one, only metadata / path / grpc-status are available.
       </p>
+
+      {status !== null && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <h3 style={{ marginTop: 0 }}>Import from observed upstreams</h3>
+          <p className="muted" style={{ marginTop: 0 }}>
+            Upstreams this proxy has forwarded gRPC calls to (and configured reverse upstreams).
+            One click asks each of them for its own descriptors via server reflection; targets whose
+            services already have descriptors are skipped.
+            {status.auto ? ' Automatic import on first sight is on.' : ' Automatic import is off (reflection.auto).'}
+          </p>
+          {status.observed.length === 0 && (
+            <div className="muted">No gRPC upstream observed yet — send some traffic through the proxy first.</div>
+          )}
+          {status.observed.map((o) => (
+            <div key={o.target} className="row" style={{ padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+              <span className="mono">{o.target}</span>
+              <span className={`tag ${o.imported ? 'mock' : o.covered ? 'captured' : 'modified'}`}>
+                {o.imported ? 'imported' : o.covered ? 'covered' : 'missing descriptors'}
+              </span>
+              <span className="muted" style={{ fontSize: 12 }}>
+                {o.services.length + o.unknownServices.length} service(s), {o.requests} request(s)
+                {o.configured ? ', configured upstream' : ''}
+              </span>
+              {o.unknownServices.length > 0 && (
+                <span className="muted mono" style={{ fontSize: 11 }}>{o.unknownServices.join(', ')}</span>
+              )}
+            </div>
+          ))}
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="btn" onClick={() => void reflectAll(true)} disabled={reflectingAll || status.observed.length === 0}>
+              {reflectingAll ? 'Importing…' : 'Import missing descriptors'}
+            </button>
+            <button className="btn" onClick={() => void reflectAll(false)} disabled={reflectingAll || status.observed.length === 0}>
+              Re-import all
+            </button>
+            <button className="btn" onClick={() => void reload()} disabled={reflectingAll}>Refresh</button>
+          </div>
+        </div>
+      )}
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Import via server reflection</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Ask the upstream for its own descriptors (grpc.reflection.v1, falling back to v1alpha).
+          Works with any gRPC server that has reflection enabled; no .proto files needed.
+        </p>
+        <div className="field">
+          <label>Upstream (host:port)</label>
+          <input
+            value={reflectTarget}
+            onChange={(e) => setReflectTarget(e.target.value)}
+            placeholder="ms-b:50052"
+            style={{ width: 320 }}
+          />
+        </div>
+        <div className="field">
+          <label>Services (optional, comma separated; all when empty)</label>
+          <input
+            value={reflectSymbols}
+            onChange={(e) => setReflectSymbols(e.target.value)}
+            placeholder="demo.TimeService, demo.AnimalSoundService"
+            style={{ width: 480 }}
+          />
+        </div>
+        <button className="btn" onClick={() => void reflect()} disabled={reflecting}>
+          {reflecting ? 'Importing…' : 'Import'}
+        </button>
+      </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Register .proto source</h3>
@@ -78,6 +230,7 @@ export function Descriptors(): JSX.Element {
             <div className="row">
               <strong>{d.name}</strong>
               <span className="tag">{d.format}</span>
+              <span className="tag">{sourceLabel(d.source)}</span>
               <span className="muted mono" style={{ fontSize: 11 }}>{d.id}</span>
               <div className="spacer" />
               <button className="btn danger" onClick={() => void remove(d.id)}>Delete</button>

@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { defaultReflection } from '../config/defaults.js';
+import { DescriptorRegistry } from '../grpc/descriptors.js';
+import { ReflectionImporter } from '../grpc/reflection-import.js';
 import { nullLogger } from '../logging/app-log.js';
 import { ScriptSandbox } from '../script/sandbox.js';
 import {
@@ -7,6 +10,7 @@ import {
   type TestStack,
   type TestUpstream,
 } from '../testing/harness.js';
+import { startReflectionUpstream } from '../testing/reflection-server.js';
 
 const cleanups: Array<() => Promise<unknown>> = [];
 
@@ -641,5 +645,177 @@ describe('error handling (spec 4.2.1)', () => {
     });
     expect(badJson.status).toBe(400);
     expect(((await badJson.json()) as { error: { code: string } }).error.code).toBe('invalid_json');
+  });
+});
+
+describe('gRPC descriptor import via server reflection (spec 4.7.6)', () => {
+  const REFLECTED_PROTO = `syntax = "proto3";
+package demo;
+service TimeService { rpc Now (NowRequest) returns (NowResponse); }
+message NowRequest { string tz = 1; }
+message NowResponse { string iso = 1; }
+`;
+
+  async function setupWithReflection(): Promise<{ stack: TestStack; target: string }> {
+    const reflected = await startReflectionUpstream({
+      protoSource: REFLECTED_PROTO,
+      serviceName: 'demo.TimeService',
+      handlers: { Now: (_call: unknown, cb: (e: null, r: unknown) => void) => cb(null, { iso: 'x' }) },
+    });
+    cleanups.push(() => Promise.resolve(reflected.close()));
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: defaultReflection(),
+    });
+    const stack = await startTestStack({ upstream: upstream.url, descriptors, reflection });
+    cleanups.push(() => stack.close());
+    return { stack, target: reflected.target };
+  }
+
+  it('imports descriptors from an upstream and lists them with provenance', async () => {
+    const { stack, target } = await setupWithReflection();
+    const res = await stack.api('/api/v1/grpc/descriptors:reflect', json({ target }));
+    expect(res.status).toBe(201);
+    const info = (await res.json()) as {
+      id: string;
+      format: string;
+      source: { type: string; target: string; protocol: string };
+      services: Array<{ fullName: string }>;
+    };
+    expect(info.format).toBe('descriptor_set');
+    expect(info.source).toMatchObject({ type: 'reflection', target, protocol: 'grpc-v1' });
+    expect(info.services.map((s) => s.fullName)).toEqual(['demo.TimeService']);
+
+    const list = (await (await stack.api('/api/v1/grpc/descriptors')).json()) as {
+      items: Array<{ id: string; source: { type: string } }>;
+    };
+    expect(list.items).toHaveLength(1);
+    expect(list.items[0]?.source.type).toBe('reflection');
+
+    const status = (await (await stack.api('/api/v1/grpc/reflection')).json()) as {
+      auto: boolean;
+      imports: Array<{ target: string; descriptorId: string }>;
+      failures: unknown[];
+    };
+    expect(status.auto).toBe(false);
+    expect(status.imports).toEqual([expect.objectContaining({ target, descriptorId: info.id })]);
+    expect(status.failures).toEqual([]);
+
+    // a mock rule with messages can now be validated against the imported schema
+    const rule = await stack.api(
+      '/api/v1/rules',
+      json({
+        id: 'mock-now',
+        protocol: 'grpc',
+        match: { type: 'regex', field: 'path', pattern: '^/demo\\.TimeService/Now$' },
+        request: {
+          action: { type: 'mock_response', response: { grpcStatus: 0, messages: [{ iso: 'mocked' }] } },
+        },
+      }),
+    );
+    expect(rule.status).toBe(201);
+  });
+
+  it('validates the request and maps reflection failures to 400 / 502', async () => {
+    const { stack } = await setupWithReflection();
+
+    const missing = await stack.api('/api/v1/grpc/descriptors:reflect', json({}));
+    expect(missing.status).toBe(400);
+    expect(((await missing.json()) as { error: { code: string } }).error.code).toBe(
+      'invalid_reflection_request',
+    );
+
+    const badSymbols = await stack.api(
+      '/api/v1/grpc/descriptors:reflect',
+      json({ target: '127.0.0.1:1', symbols: 'demo.TimeService' }),
+    );
+    expect(badSymbols.status).toBe(400);
+
+    const badTarget = await stack.api('/api/v1/grpc/descriptors:reflect', json({ target: 'no-port' }));
+    expect(badTarget.status).toBe(400);
+    const badTargetBody = (await badTarget.json()) as {
+      error: { code: string; details: Array<{ reason: string }> };
+    };
+    expect(badTargetBody.error.code).toBe('reflection_failed');
+    expect(badTargetBody.error.details[0]?.reason).toBe('invalid_target');
+
+    const unreachable = await stack.api(
+      '/api/v1/grpc/descriptors:reflect',
+      json({ target: '127.0.0.1:1', timeoutMs: 500 }),
+    );
+    expect(unreachable.status).toBe(502);
+    const unreachableBody = (await unreachable.json()) as {
+      error: { code: string; details: Array<{ reason: string }> };
+    };
+    expect(unreachableBody.error.code).toBe('reflection_failed');
+    expect(unreachableBody.error.details[0]?.reason).toBe('unavailable');
+
+    const status = (await (await stack.api('/api/v1/grpc/reflection')).json()) as {
+      failures: Array<{ target: string; reason: string }>;
+    };
+    expect(status.failures).toEqual([expect.objectContaining({ target: '127.0.0.1:1', reason: 'unavailable' })]);
+  });
+
+  it('imports every observed upstream in one shot', async () => {
+    const reflected = await startReflectionUpstream({
+      protoSource: REFLECTED_PROTO,
+      serviceName: 'demo.TimeService',
+      handlers: { Now: (_call: unknown, cb: (e: null, r: unknown) => void) => cb(null, { iso: 'x' }) },
+    });
+    cleanups.push(() => Promise.resolve(reflected.close()));
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const descriptors = new DescriptorRegistry();
+    const reflection = new ReflectionImporter({
+      registry: descriptors,
+      appLog: nullLogger(),
+      settings: defaultReflection(),
+    });
+    // what the gRPC listener records for every forwarded call
+    reflection.observe(reflected.target, 'demo.TimeService', false);
+    reflection.observe('127.0.0.1:1', 'other.Svc', false);
+    const stack = await startTestStack({ upstream: upstream.url, descriptors, reflection });
+    cleanups.push(() => stack.close());
+
+    const before = (await (await stack.api('/api/v1/grpc/reflection')).json()) as {
+      observed: Array<{ target: string; unknownServices: string[]; covered: boolean }>;
+    };
+    expect(before.observed).toHaveLength(2);
+    expect(before.observed.find((o) => o.target === reflected.target)).toMatchObject({
+      unknownServices: ['demo.TimeService'],
+      covered: false,
+    });
+
+    const res = await stack.api('/api/v1/grpc/descriptors:reflect-all', json({}));
+    expect(res.status).toBe(200);
+    const result = (await res.json()) as {
+      imported: number;
+      failed: number;
+      skipped: number;
+      targets: Array<{ target: string; status: string; reason?: string }>;
+    };
+    expect(result).toMatchObject({ imported: 1, failed: 1, skipped: 0 });
+    expect(result.targets.find((t) => t.target === reflected.target)?.status).toBe('imported');
+    expect(result.targets.find((t) => t.target === '127.0.0.1:1')).toMatchObject({
+      status: 'failed',
+      reason: 'unavailable',
+    });
+    expect(descriptors.hasService('demo.TimeService')).toBe(true);
+
+    const bad = await stack.api('/api/v1/grpc/descriptors:reflect-all', json({ onlyMissing: 'yes' }));
+    expect(bad.status).toBe(400);
+  });
+
+  it('answers 400 when the process has no reflection importer', async () => {
+    const { stack } = await setup();
+    const res = await stack.api('/api/v1/grpc/descriptors:reflect', json({ target: '127.0.0.1:1' }));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('reflection_unavailable');
+    expect((await stack.api('/api/v1/grpc/reflection')).status).toBe(400);
+    expect((await stack.api('/api/v1/grpc/descriptors:reflect-all', json({}))).status).toBe(400);
   });
 });

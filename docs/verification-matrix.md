@@ -2,7 +2,7 @@
 
 docs/spec.md の各要件について「実装 → unit test → 実機/UI 検証」の対応を示す。
 
-- **Unit**: 該当機能を検証する vitest テスト(合計 236 件 / 19 ファイル、`npm test`)
+- **Unit**: 該当機能を検証する vitest テスト(合計 304 件 / 24 ファイル、`npm test`)
 - **GKE**: GCP `<GCP_PROJECT_ID>`(ms-a 両方向サイドカー)での実 traffic 検証
 - **UI**: playwright-mcp による実デプロイの UI 操作検証
 
@@ -12,6 +12,7 @@ docs/spec.md の各要件について「実装 → unit test → 実機/UI 検�
 | spec | 実装 | Unit test | GKE / UI 実機検証 |
 | --- | --- | --- | --- |
 | 4.1.1 透過転送 | `src/proxy/pipeline.ts`, `http-listener.ts` | `proxy.integration.test.ts`(transparent forwarding, hop-by-hop, Host 保持) | GKE: ms-b→ms-a /echo が素通しで 200 |
+| 4.1.1 同名 header field の個別転送(gRPC `-bin` metadata 含む) | `proxy/headers.ts`(`fromRawHeaders`)、`grpc/grpc-listener.ts`、`proxy/upstream.ts`、`proxy/http-listener.ts` | `headers.test.ts`、`metadata.integration.test.ts`(同 key の -bin 2 値を request / response metadata / trailer で往復、streaming と unary の両経路) | dev 実機で `malformed binary metadata` により失敗した request を根拠に修正 |
 | 4.1.2 upstream 障害応答 | `pipeline.ts`, `upstream.ts` | `proxy.integration.test.ts`(502/504 + x-morpheus-error) | GKE: upstream down → 502(前環境検証、実装同一) |
 | 4.1.3 trace id | `pipeline.ts` | (metadata 経路) | — |
 | 4.1.4 / 4.9 ログ保存方針 | `logging/traffic-log.ts` | `traffic-log.test.ts` | GKE: unmatched 非記録、capture のみ記録を確認 |
@@ -37,6 +38,7 @@ docs/spec.md の各要件について「実装 → unit test → 実機/UI 検�
 | 4.6 消費型 rule | `rules/consume.ts` | `consume.test.ts` | GKE: times=2 → 適用 2 回→透過 |
 | 4.7.1-4 gRPC unary/path/descriptor/fault | `grpc/*.ts` | `grpc.integration.test.ts`, `descriptors.test.ts` | GKE: descriptor 登録(well-known import)、decoded body capture |
 | 4.7.5 gRPC streaming | `grpc/grpc-listener.ts` | `grpc.integration.test.ts`(streaming metadata/trailer/status) | unit(server streaming) |
+| 4.7.6 server reflection による descriptor 取得 | `grpc/reflection.ts`, `grpc/reflection-import.ts`, `admin/server.ts`, `config/load.ts` | `reflection.test.ts`(v1→v1alpha fallback / 重複排除 / not_found / unavailable / timeout / too_large / metadata)、`reflection-import.test.ts`(single-flight / negative cache / allow / 起動時再試行)、`admin-api.integration.test.ts`(`descriptors:reflect`, `descriptors:reflect-all`, `GET /grpc/reflection`)、`connect.integration.test.ts`(CONNECT authority からの on-demand 取得 → decode → mock、auto off での観測 → one-shot 取得) | docker compose demo(ms-a→ms-b、`reflection.auto`) |
 | 4.8 HTTP handling / body limit | `proxy/body.ts`, `pipeline.ts` | `proxy.integration.test.ts`(413, streaming) | — |
 | 4.9.1-3 log event/policy | `logging/traffic-log.ts` | `traffic-log.test.ts` | GKE + UI Logs |
 | 4.9.4 Retention | `retention.ts` | `retention.test.ts` | — |

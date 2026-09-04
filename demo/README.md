@@ -30,7 +30,12 @@ morpheus is configured entirely by [morpheus.jsonc](morpheus.jsonc) via
   morpheus CONNECT proxy.
 - `morpheus-proxy`: one `mode: "connect"` gRPC listener on `:15052`; admin API /
   web UI on `:18081`.
-- `ms-b`: `demo.TimeService/Now` and `demo.AnimalSoundService/Sound`.
+- `ms-b`: `demo.TimeService/Now` and `demo.AnimalSoundService/Sound`, with gRPC
+  server reflection enabled so morpheus can fetch its descriptors (spec 4.7.6).
+  The services are hand-written (no protoc step), so
+  [internal/rpc/descriptor.go](internal/rpc/descriptor.go) registers the
+  `proto/demo.proto` file descriptor that generated code would embed — without
+  it reflection can list the services but not resolve them.
 
 ## Run
 
@@ -103,8 +108,53 @@ curl -s 'http://localhost:18080/echo?message=t2'
 curl -s 'http://localhost:18080/echo?message=t3'   # recovered
 ```
 
-gRPC message bodies (mock, body matchers, decoded body logging) require a
-descriptor — register `demo.proto` at `POST $A/grpc/descriptors`. See spec 4.7.
+## Message bodies without uploading a .proto (server reflection)
+
+gRPC message bodies (mock `messages`, body matchers, decoded body logging) need a
+descriptor. `ms-b` enables gRPC server reflection and [morpheus.jsonc](morpheus.jsonc)
+sets `"reflection": { "auto": true }`, so morpheus fetches the descriptors from
+`ms-b` itself the first time it sees a method it does not know (spec 4.7.6):
+
+```sh
+curl -s 'http://localhost:18080/echo?message=first' >/dev/null   # triggers the import in the background
+curl -s "$A/grpc/reflection" | jq .   # "imports": [{ "target": "<ms-b authority>:50052", "protocol": "grpc-v1", ... }]
+curl -s "$A/grpc/descriptors" | jq '.items[] | {name, source, services: [.services[].fullName]}'
+
+curl -s 'http://localhost:18080/echo?message=second' >/dev/null  # now decoded: log entries carry the JSON body
+curl -s "$A/logs?limit=2" | jq '.items[] | {path: .request.path, body: .response.bodyPreview}'
+```
+
+With the schema known, message-level rules validate and apply — mock `Now`:
+
+```sh
+curl -s "$A/rules" -H 'content-type: application/json' -d '{
+  "id":"mock-now","protocol":"grpc","priority":100,
+  "match":{"type":"regex","field":"path","pattern":"^/demo\\.TimeService/Now$"},
+  "request":{"action":{"type":"mock_response","response":{"grpcStatus":0,"messages":[{"value":"2000-01-01T00:00:00Z"}]}}}
+}' >/dev/null
+curl -s 'http://localhost:18080/echo?message=mocked'   # "upstream_time": "2000-01-01T00:00:00Z"
+```
+
+The import target is whatever CONNECT authority `ms-a` used — with grpc-go's
+default DNS resolver that is the resolved IP (`172.x.x.x:50052`); a client using
+the passthrough resolver would show `ms-b:50052`.
+
+With `reflection.auto` off you can still import in one shot from every upstream
+the proxy has seen — the "Import missing descriptors" button on the Descriptors
+page of the web UI, or:
+
+```sh
+curl -s -X POST "$A/grpc/descriptors:reflect-all" | jq .
+```
+
+To import explicitly instead (or for an upstream you have not called yet):
+
+```sh
+curl -s "$A/grpc/descriptors:reflect" -H 'content-type: application/json' -d '{"target":"ms-b:50052"}' | jq .
+```
+
+Upstreams without reflection still take a manual upload at `POST $A/grpc/descriptors`
+(descriptor set or `.proto` source). See spec 4.7 and api-manual §13.
 
 ## Web UI
 

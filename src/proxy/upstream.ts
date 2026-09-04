@@ -2,7 +2,7 @@ import http from 'node:http';
 import http2 from 'node:http2';
 import { Readable } from 'node:stream';
 import type { HeaderMap } from '../rules/matcher.js';
-import { fromNodeHeaders, toOutgoingHeaders } from './headers.js';
+import { fromHttp2Headers, fromNodeHeaders, toOutgoingHeaders } from './headers.js';
 
 export interface UpstreamTarget {
   kind: 'http' | 'h2c';
@@ -149,21 +149,23 @@ function sendH2c(target: UpstreamTarget, init: UpstreamRequestInit): Promise<Ups
       endStream: init.body === undefined,
     });
     let trailers: HeaderMap = {};
-    stream.on('trailers', (incoming: http2.IncomingHttpHeaders) => {
-      trailers = fromNodeHeaders(incoming);
+    // Node joins repeated header fields with ", " in the headers object; the raw
+    // list keeps them apart so repeated metadata is relayed field by field.
+    stream.on('trailers', (incoming: http2.IncomingHttpHeaders, _flags: number, rawHeaders?: string[]) => {
+      trailers = fromHttp2Headers(incoming, rawHeaders);
     });
     stream.on('error', (err: NodeJS.ErrnoException) => {
       clearTimeout(timer);
       fail(new UpstreamError(classifyError(err), err.message));
     });
-    stream.on('response', (incoming) => {
+    stream.on('response', (incoming, _flags, rawHeaders?: string[]) => {
       settled = true;
       clearTimeout(timer);
       const statusCode = Number(incoming[':status'] ?? 502);
       stream.on('close', () => session.close());
       resolve({
         statusCode,
-        headers: fromNodeHeaders(incoming),
+        headers: fromHttp2Headers(incoming, rawHeaders),
         stream: stream as unknown as Readable,
         trailers: () => trailers,
       });

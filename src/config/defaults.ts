@@ -1,4 +1,4 @@
-import type { ListenerConfig, MorpheusConfig } from './types.js';
+import type { ListenerConfig, MorpheusConfig, ReflectionConfig } from './types.js';
 
 export const DEFAULT_HTTP_LISTENER_PORT = 18080;
 export const DEFAULT_GRPC_LISTENER_PORT = 15051;
@@ -31,6 +31,17 @@ export function defaultGrpcListener(): ListenerConfig {
   };
 }
 
+export function defaultReflection(): ReflectionConfig {
+  return {
+    auto: false,
+    allow: ['*'],
+    timeoutMs: 3_000,
+    negativeTtlMs: 60_000,
+    maxBytes: 16_777_216,
+    metadata: {},
+  };
+}
+
 /**
  * Hard coded defaults. Must stay identical to config/default.jsonc — that
  * invariant is enforced by a test (spec 4.13).
@@ -57,6 +68,7 @@ export function defaultConfig(): MorpheusConfig {
       upstreamTimeoutMs: 30_000,
       idleTimeoutMs: 60_000,
     },
+    reflection: defaultReflection(),
     logging: {
       trafficLogDir: 'logs/morpheus-proxy/traffic',
       appLogDir: 'logs/morpheus-proxy/app',

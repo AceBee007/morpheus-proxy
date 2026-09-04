@@ -23,6 +23,41 @@ export function fromNodeHeaders(raw: IncomingHttpHeaders): HeaderMap {
 }
 
 /**
+ * Builds a HeaderMap from a raw `[name, value, name, value, ...]` list as
+ * delivered alongside HTTP/2 events. Unlike the headers object, which joins
+ * repeated fields with ", " (lossy: gRPC `-bin` metadata is base64 per field
+ * and cannot be re-split safely), every repeated name is kept as an array so
+ * it can be forwarded as separate fields again (spec 4.1.1). Names are
+ * lowercased; pseudo-headers are dropped.
+ */
+export function fromRawHeaders(raw: readonly string[]): HeaderMap {
+  const headers: HeaderMap = {};
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const name = (raw[i] as string).toLowerCase();
+    const value = raw[i + 1] as string;
+    if (name.startsWith(':')) continue;
+    const existing = headers[name];
+    if (existing === undefined) headers[name] = value;
+    else if (Array.isArray(existing)) existing.push(value);
+    else headers[name] = [existing, value];
+  }
+  return headers;
+}
+
+/**
+ * Prefers the raw header list (exact, repeat-preserving) when Node supplied
+ * one and falls back to the joined headers object otherwise.
+ */
+export function fromHttp2Headers(
+  headers: IncomingHttpHeaders,
+  rawHeaders: readonly string[] | undefined,
+): HeaderMap {
+  return Array.isArray(rawHeaders) && rawHeaders.length > 0
+    ? fromRawHeaders(rawHeaders)
+    : fromNodeHeaders(headers);
+}
+
+/**
  * Returns a copy without hop-by-hop headers, including any header named by
  * the Connection header itself.
  */

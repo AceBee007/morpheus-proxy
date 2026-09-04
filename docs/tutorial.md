@@ -172,6 +172,8 @@ gRPC Descriptors 画面でも、登録した service / method の一覧が確認
 
 ![gRPC Descriptors 画面。登録した proto の service/method 一覧が表示されている](resources/step07a-descriptors.png)
 
+**別解(server reflection)**: 下流が gRPC server reflection を公開していれば(grpc-go は `reflection.Register` の 1 行)、`.proto` を用意せずに `POST $A/grpc/descriptors:reflect` に `{"target":"<下流>:<port>"}` を投げるか、config で `"reflection": { "auto": true }` にしておくだけで morpheus が下流から descriptor を取り込みます(spec 4.7.6、api-manual §13)。
+
 **注意**: `.proto` source の import は well-known types(`google/protobuf/*.proto`)のみ自動解決されます。自作 proto を import している場合は、依存を 1 ファイルに統合するか、API から `format: "descriptor_set"`(`protoc --include_imports` / `buf build` の出力)で登録してください(詳細は [api-manual.md](api-manual.md) §13)。
 
 ### 7-2. decoded body を確認する

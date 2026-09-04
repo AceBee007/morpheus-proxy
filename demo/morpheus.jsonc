@@ -24,6 +24,12 @@
       "mode": "connect"
     }
   ],
+  // Descriptors come from the downstream itself: ms-b enables gRPC server
+  // reflection, so the first ms-a -> ms-b call of a method without a descriptor
+  // triggers an import in the background and every later call is decoded
+  // (body logging, body matchers, mock `messages`, manipulation). No .proto
+  // upload needed. See docs/spec.md 4.7.6.
+  "reflection": { "auto": true },
   "logging": {
     "trafficLogDir": "/tmp/morpheus/traffic",
     "appLogDir": "/tmp/morpheus/app"
