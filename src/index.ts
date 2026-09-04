@@ -10,6 +10,7 @@ import { startAdminServer, type AdminServer } from './admin/server.js';
 import { loadConfig } from './config/load.js';
 import { DescriptorRegistry } from './grpc/descriptors.js';
 import { startGrpcListener } from './grpc/grpc-listener.js';
+import { ReflectionImporter } from './grpc/reflection-import.js';
 import { grpcBodyValidatorFor } from './grpc/rule-validation.js';
 import { AppLogger } from './logging/app-log.js';
 import { MaskRegistry } from './logging/mask.js';
@@ -50,23 +51,45 @@ async function main(): Promise<void> {
   const ruleStore = new RuleStore({ onRuleChanged: (id) => consume.reset(id) });
   const metrics = new MetricsRegistry();
   const descriptors = new DescriptorRegistry();
+  const reflection = new ReflectionImporter({
+    registry: descriptors,
+    appLog,
+    metrics,
+    settings: config.reflection,
+  });
   const validateOptions: ValidateRuleOptions = {
     scriptMaxTimeoutMs: config.script.maxTimeoutMs,
     grpcBodyValidator: grpcBodyValidatorFor(descriptors),
   };
 
-  // Descriptor files referenced by listeners: unreadable files are skipped
-  // with a warning; startup continues (spec 4.13)
+  // Descriptor sources referenced by listeners: unreadable files are skipped
+  // with a warning and reflection imports retry in the background; startup
+  // continues either way (spec 4.13, 4.7.6)
   for (const listenerConfig of config.listeners) {
-    for (const file of listenerConfig.descriptors) {
+    for (const source of listenerConfig.descriptors) {
+      if (typeof source !== 'string') {
+        appLog.info('descriptor import via reflection scheduled from config', {
+          target: source.reflect,
+          ...(source.symbols ? { symbols: source.symbols } : {}),
+        });
+        reflection.scheduleStartupImport(source.reflect, source.symbols);
+        continue;
+      }
+      const file = source;
       try {
         if (file.endsWith('.proto')) {
-          descriptors.add({ name: file, format: 'proto_source', content: readFileSync(file, 'utf8') });
+          descriptors.add({
+            name: file,
+            format: 'proto_source',
+            content: readFileSync(file, 'utf8'),
+            source: { type: 'file', path: file },
+          });
         } else {
           descriptors.add({
             name: file,
             format: 'descriptor_set',
             content: readFileSync(file).toString('base64'),
+            source: { type: 'file', path: file },
           });
         }
         appLog.info('descriptor loaded from config', { file });
@@ -114,11 +137,11 @@ async function main(): Promise<void> {
       manipulatorRunner,
     };
     if (listenerConfig.mode === 'connect') {
-      listeners.push(await startConnectListener({ ...runtime, descriptors }));
+      listeners.push(await startConnectListener({ ...runtime, descriptors, reflection }));
     } else if (listenerConfig.protocol === 'http') {
       listeners.push(await startHttpListener(runtime));
     } else {
-      listeners.push(await startGrpcListener({ ...runtime, descriptors }));
+      listeners.push(await startGrpcListener({ ...runtime, descriptors, reflection }));
     }
   }
 
@@ -134,6 +157,7 @@ async function main(): Promise<void> {
     appLog,
     metrics,
     descriptors,
+    reflection,
     listeners: () => listeners,
     ready: () => ready,
     startedAt,
@@ -164,6 +188,7 @@ async function main(): Promise<void> {
     ready = false;
     appLog.info(`received ${signal}, shutting down`);
     retention.stop();
+    reflection.close();
     void Promise.all([adminServer.close(), sandbox.close(), ...listeners.map((l) => l.close())])
       .then(() => trafficLog.flush())
       .then(() => appLog.flush())

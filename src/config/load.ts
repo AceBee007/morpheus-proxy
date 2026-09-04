@@ -8,7 +8,13 @@ import {
   defaultGrpcListener,
   defaultHttpListener,
 } from './defaults.js';
-import type { ConfigLoadResult, ListenerConfig, MorpheusConfig } from './types.js';
+import type {
+  ConfigLoadResult,
+  DescriptorSourceConfig,
+  ListenerConfig,
+  MorpheusConfig,
+  ReflectionDescriptorSource,
+} from './types.js';
 
 export interface LoadConfigOptions {
   /** CLI arguments, typically process.argv.slice(2). */
@@ -98,6 +104,17 @@ class SectionReader {
     return fallback;
   }
 
+  /** An object whose values are all strings (e.g. metadata / header maps). */
+  stringRecord(key: string, fallback: Record<string, string>): Record<string, string> {
+    if (!(key in this.raw)) return fallback;
+    const value = this.raw[key];
+    if (isPlainObject(value) && Object.values(value).every((v) => typeof v === 'string')) {
+      return { ...(value as Record<string, string>) };
+    }
+    this.warn(key, 'an object of string values', value);
+    return fallback;
+  }
+
   warnUnknownKeys(known: string[]): void {
     for (const key of Object.keys(this.raw)) {
       if (!known.includes(key)) {
@@ -122,6 +139,54 @@ function section(raw: Raw, key: string, warnings: string[]): Raw | null {
 }
 
 const UPSTREAM_PATTERN = /^(http|h2c):\/\/.+/;
+
+/**
+ * `descriptors` entries are file paths or `{ "reflect": "host:port", "symbols"?: [] }`
+ * reflection sources (spec 4.7.3 / 4.7.6). Invalid entries are skipped with a warning.
+ */
+function descriptorSources(
+  raw: Raw,
+  path: string,
+  warnings: string[],
+  fallback: DescriptorSourceConfig[],
+): DescriptorSourceConfig[] {
+  if (!('descriptors' in raw)) return fallback;
+  const value = raw['descriptors'];
+  if (!Array.isArray(value)) {
+    warnings.push(`config: ${path}descriptors is ${describe(value)}, expected an array; using default`);
+    return fallback;
+  }
+  const sources: DescriptorSourceConfig[] = [];
+  value.forEach((entry: unknown, index) => {
+    if (typeof entry === 'string') {
+      sources.push(entry);
+      return;
+    }
+    if (isPlainObject(entry) && typeof entry['reflect'] === 'string' && entry['reflect'] !== '') {
+      const source: ReflectionDescriptorSource = { reflect: entry['reflect'] };
+      const symbols = entry['symbols'];
+      if (symbols !== undefined) {
+        if (Array.isArray(symbols) && symbols.every((s) => typeof s === 'string')) {
+          source.symbols = symbols;
+        } else {
+          warnings.push(
+            `config: ${path}descriptors[${index}].symbols is ${describe(symbols)}, expected an array of strings; importing every service`,
+          );
+        }
+      }
+      new SectionReader(entry, `${path}descriptors[${index}].`, warnings).warnUnknownKeys([
+        'reflect',
+        'symbols',
+      ]);
+      sources.push(source);
+      return;
+    }
+    warnings.push(
+      `config: ${path}descriptors[${index}] must be a file path or { "reflect": "host:port" }; skipped`,
+    );
+  });
+  return sources;
+}
 
 function mergeListener(
   raw: unknown,
@@ -181,7 +246,7 @@ function mergeListener(
     ...(mode === 'connect' ? { mode } : {}),
     upstream: upstreamValue,
     decodeBody: reader.boolean('decodeBody', base.decodeBody),
-    descriptors: reader.stringArray('descriptors', base.descriptors),
+    descriptors: descriptorSources(raw, path, warnings, base.descriptors),
     maxRequestBodyBufferBytes: reader.positiveInt(
       'maxRequestBodyBufferBytes',
       base.maxRequestBodyBufferBytes,
@@ -325,6 +390,21 @@ export function mergeWithDefaults(raw: Raw, warnings: string[]): MorpheusConfig 
     ]);
   }
 
+  const reflection = section(raw, 'reflection', warnings);
+  if (reflection) {
+    const reader = new SectionReader(reflection, 'reflection.', warnings);
+    config.reflection.auto = reader.boolean('auto', config.reflection.auto);
+    config.reflection.allow = reader.stringArray('allow', config.reflection.allow);
+    config.reflection.timeoutMs = reader.positiveInt('timeoutMs', config.reflection.timeoutMs);
+    config.reflection.negativeTtlMs = reader.positiveInt(
+      'negativeTtlMs',
+      config.reflection.negativeTtlMs,
+    );
+    config.reflection.maxBytes = reader.positiveInt('maxBytes', config.reflection.maxBytes);
+    config.reflection.metadata = reader.stringRecord('metadata', config.reflection.metadata);
+    reader.warnUnknownKeys(['auto', 'allow', 'timeoutMs', 'negativeTtlMs', 'maxBytes', 'metadata']);
+  }
+
   const logging = section(raw, 'logging', warnings);
   if (logging) {
     const reader = new SectionReader(logging, 'logging.', warnings);
@@ -375,6 +455,7 @@ export function mergeWithDefaults(raw: Raw, warnings: string[]): MorpheusConfig 
     'rules',
     'script',
     'limits',
+    'reflection',
     'logging',
   ]);
 

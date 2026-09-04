@@ -3,12 +3,15 @@ import http2 from 'node:http2';
 import net from 'node:net';
 import type { DescriptorRegistry } from '../grpc/descriptors.js';
 import { grpcStreamHandler, type GrpcRuntime } from '../grpc/grpc-listener.js';
+import type { ReflectionImporter } from '../grpc/reflection-import.js';
 import { H2_PREFACE, h1Exchange, h2Exchange, type StartedListener } from './http-listener.js';
 import { handleHttpExchange, type ProxyRuntime } from './pipeline.js';
 
 /** Runtime for a CONNECT listener. `descriptors` is required for gRPC. */
 export interface ConnectRuntime extends ProxyRuntime {
   descriptors?: DescriptorRegistry;
+  /** On-demand descriptor import via server reflection (spec 4.7.6). */
+  reflection?: ReflectionImporter;
 }
 
 /** Cap the CONNECT request head to avoid unbounded buffering before the tunnel. */

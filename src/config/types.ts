@@ -1,5 +1,30 @@
 export type ListenerProtocol = 'http' | 'grpc';
 
+/** Import descriptors from `reflect` (host:port) via gRPC server reflection. */
+export interface ReflectionDescriptorSource {
+  reflect: string;
+  /** Services to import; every listed service when omitted. */
+  symbols?: string[];
+}
+
+export type DescriptorSourceConfig = string | ReflectionDescriptorSource;
+
+/** Server reflection settings (spec 4.7.6). */
+export interface ReflectionConfig {
+  /** Import descriptors on demand when a gRPC method has no registered descriptor. */
+  auto: boolean;
+  /** Glob patterns (`*` wildcard) of authorities that may be queried. */
+  allow: string[];
+  /** Deadline per reflection RPC. */
+  timeoutMs: number;
+  /** How long a failed target is left alone before automatic imports retry. */
+  negativeTtlMs: number;
+  /** Upper bound on descriptor bytes accepted from one target. */
+  maxBytes: number;
+  /** Extra request metadata sent with reflection calls (e.g. credentials). */
+  metadata: Record<string, string>;
+}
+
 export interface ListenerConfig {
   name: string;
   protocol: ListenerProtocol;
@@ -20,8 +45,12 @@ export interface ListenerConfig {
    */
   upstream: string;
   decodeBody: boolean;
-  /** Paths to protobuf descriptor set files, gRPC listeners only. */
-  descriptors: string[];
+  /**
+   * Descriptor sources loaded at startup, gRPC listeners only (spec 4.7.3 /
+   * 4.7.6): a path to a `.proto` or descriptor set file, or an upstream to
+   * import from via server reflection.
+   */
+  descriptors: DescriptorSourceConfig[];
   maxRequestBodyBufferBytes: number;
   maxResponseBodyBufferBytes: number;
 }
@@ -71,6 +100,7 @@ export interface MorpheusConfig {
   rules: RulesConfig;
   script: ScriptConfig;
   limits: LimitsConfig;
+  reflection: ReflectionConfig;
   logging: LoggingConfig;
 }
 

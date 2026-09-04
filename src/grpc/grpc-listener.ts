@@ -26,9 +26,22 @@ import {
 import type { Rule } from '../rules/types.js';
 import type { DescriptorRegistry, ResolvedMethod } from './descriptors.js';
 import { decodeGrpcFrames, encodeGrpcFrame, encodeGrpcMessage } from './frames.js';
+import type { ReflectionImporter } from './reflection-import.js';
 
 export interface GrpcRuntime extends ProxyRuntime {
   descriptors: DescriptorRegistry;
+  /** On-demand descriptor import via server reflection (spec 4.7.6). */
+  reflection?: ReflectionImporter;
+}
+
+/** `host:port` of the listener's upstream (the CONNECT authority or the reverse upstream). */
+function upstreamAuthority(upstream: string): string | null {
+  try {
+    const target = parseUpstream(upstream);
+    return `${target.host}:${target.port}`;
+  } catch {
+    return null;
+  }
 }
 
 const GRPC_STATUS = {
@@ -1269,6 +1282,15 @@ export function grpcStreamHandler(
       startedAt: (runtime.now ?? (() => new Date()))(),
       method: runtime.descriptors.lookupMethod(String(headers[':path'] ?? '/')),
     };
+    if (runtime.reflection) {
+      // Unknown method: import the upstream's descriptors in the background so
+      // later calls are decoded; this call is relayed as before (spec 4.7.6).
+      const target = upstreamAuthority(runtime.listener.upstream);
+      if (target !== null) {
+        if (ctx.method === null) runtime.reflection.ensure(target, ctx.path);
+        else runtime.reflection.noteAuthority(ctx.method.service, target);
+      }
+    }
     handleGrpcStream(runtime, ctx).catch((err: unknown) => {
       appLog.error('grpc handler error', { path: ctx.path, error: String(err) });
       if (!stream.headersSent && !stream.destroyed) {

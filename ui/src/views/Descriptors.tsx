@@ -6,7 +6,15 @@ interface DescriptorInfo {
   id: string;
   name: string;
   format: string;
+  source?: { type: string; target?: string; path?: string; protocol?: string; fetchedAt?: string };
   services: Array<{ fullName: string; methods: Array<{ name: string; requestStream: boolean; responseStream: boolean }> }>;
+}
+
+function sourceLabel(source: DescriptorInfo['source']): string {
+  if (!source) return 'upload';
+  if (source.type === 'reflection') return `reflection ${source.target ?? ''}${source.protocol ? ` (${source.protocol})` : ''}`;
+  if (source.type === 'file') return `file ${source.path ?? ''}`;
+  return source.type;
 }
 
 export function Descriptors(): JSX.Element {
@@ -16,6 +24,9 @@ export function Descriptors(): JSX.Element {
   const [source, setSource] = useState(
     'syntax = "proto3";\npackage demo;\nservice TimeService {\n  rpc Now (NowRequest) returns (NowResponse);\n}\nmessage NowRequest { string tz = 1; }\nmessage NowResponse { string iso = 1; }\n',
   );
+  const [reflectTarget, setReflectTarget] = useState('');
+  const [reflectSymbols, setReflectSymbols] = useState('');
+  const [reflecting, setReflecting] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -40,6 +51,28 @@ export function Descriptors(): JSX.Element {
     }
   };
 
+  const reflect = async (): Promise<void> => {
+    const target = reflectTarget.trim();
+    if (target === '') {
+      toast('err', 'Enter the upstream host:port to query');
+      return;
+    }
+    const symbols = reflectSymbols
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    setReflecting(true);
+    try {
+      const info = (await api.reflectDescriptors({ target, ...(symbols.length > 0 ? { symbols } : {}) })) as unknown as DescriptorInfo;
+      toast('ok', `Imported ${info.services.length} service(s) from ${target}`);
+      await reload();
+    } catch (err) {
+      toast('err', err instanceof Error ? err.message : String(err));
+    } finally {
+      setReflecting(false);
+    }
+  };
+
   const remove = async (id: string): Promise<void> => {
     try {
       await api.deleteDescriptor(id);
@@ -56,6 +89,35 @@ export function Descriptors(): JSX.Element {
         gRPC body decode, matching, mock generation and manipulation require a registered
         descriptor. Without one, only metadata / path / grpc-status are available.
       </p>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Import via server reflection</h3>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Ask the upstream for its own descriptors (grpc.reflection.v1, falling back to v1alpha).
+          Works with any gRPC server that has reflection enabled; no .proto files needed.
+        </p>
+        <div className="field">
+          <label>Upstream (host:port)</label>
+          <input
+            value={reflectTarget}
+            onChange={(e) => setReflectTarget(e.target.value)}
+            placeholder="ms-b:50052"
+            style={{ width: 320 }}
+          />
+        </div>
+        <div className="field">
+          <label>Services (optional, comma separated; all when empty)</label>
+          <input
+            value={reflectSymbols}
+            onChange={(e) => setReflectSymbols(e.target.value)}
+            placeholder="demo.TimeService, demo.AnimalSoundService"
+            style={{ width: 480 }}
+          />
+        </div>
+        <button className="btn" onClick={() => void reflect()} disabled={reflecting}>
+          {reflecting ? 'Importing…' : 'Import'}
+        </button>
+      </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Register .proto source</h3>
@@ -78,6 +140,7 @@ export function Descriptors(): JSX.Element {
             <div className="row">
               <strong>{d.name}</strong>
               <span className="tag">{d.format}</span>
+              <span className="tag">{sourceLabel(d.source)}</span>
               <span className="muted mono" style={{ fontSize: 11 }}>{d.id}</span>
               <div className="spacer" />
               <button className="btn danger" onClick={() => void remove(d.id)}>Delete</button>

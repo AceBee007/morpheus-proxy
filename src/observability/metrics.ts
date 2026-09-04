@@ -5,6 +5,8 @@ export interface MetricsSnapshot {
   ruleHits: Record<string, number>;
   faultInjections: number;
   scriptErrors: number;
+  /** reflection descriptor imports by result: `success` or a failure reason (spec 4.7.6). */
+  reflectionImports: Record<string, number>;
   upstreamLatency: {
     bucketsMs: number[];
     counts: number[];
@@ -24,6 +26,7 @@ export class MetricsRegistry {
   private ruleHits = new Map<string, number>();
   private faultInjections = 0;
   private scriptErrors = 0;
+  private reflectionImports = new Map<string, number>();
   private latencyCounts = new Array<number>(LATENCY_BUCKETS_MS.length).fill(0);
   private latencyInf = 0;
   private latencyTotalMs = 0;
@@ -51,12 +54,17 @@ export class MetricsRegistry {
     this.scriptErrors += 1;
   }
 
+  recordReflectionImport(result: string): void {
+    this.reflectionImports.set(result, (this.reflectionImports.get(result) ?? 0) + 1);
+  }
+
   snapshot(): MetricsSnapshot {
     return {
       requestsByOutcome: Object.fromEntries(this.requestsByOutcome),
       ruleHits: Object.fromEntries(this.ruleHits),
       faultInjections: this.faultInjections,
       scriptErrors: this.scriptErrors,
+      reflectionImports: Object.fromEntries(this.reflectionImports),
       upstreamLatency: {
         bucketsMs: [...LATENCY_BUCKETS_MS],
         counts: [...this.latencyCounts],
@@ -81,6 +89,10 @@ export class MetricsRegistry {
     lines.push(`morpheus_fault_injections_total ${this.faultInjections}`);
     lines.push('# TYPE morpheus_script_errors_total counter');
     lines.push(`morpheus_script_errors_total ${this.scriptErrors}`);
+    lines.push('# TYPE morpheus_reflection_imports_total counter');
+    for (const [result, count] of this.reflectionImports) {
+      lines.push(`morpheus_reflection_imports_total{result="${result}"} ${count}`);
+    }
     lines.push('# TYPE morpheus_active_connections gauge');
     lines.push(`morpheus_active_connections ${activeConnections}`);
     lines.push('# TYPE morpheus_upstream_latency_ms histogram');

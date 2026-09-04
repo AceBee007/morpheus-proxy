@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import protobuf from 'protobufjs';
 import descriptorExt from 'protobufjs/ext/descriptor/index.js';
+import type { ReflectionProtocol } from './reflection-proto.js';
 
 // The descriptor extension ships without usable typings: the module is a
 // protobuf Root carrying descriptor.proto types, and it augments Root with
@@ -24,11 +25,26 @@ export interface DescriptorServiceInfo {
   methods: DescriptorMethodInfo[];
 }
 
+/** Where a registered descriptor came from (spec 4.7.3 / 4.7.6). */
+export type DescriptorSource =
+  | { type: 'upload' }
+  | { type: 'file'; path: string }
+  | {
+      type: 'reflection';
+      /** Upstream `host:port` the descriptors were fetched from. */
+      target: string;
+      protocol: ReflectionProtocol;
+      /** Services that were requested from the server. */
+      symbols: string[];
+      fetchedAt: string;
+    };
+
 export interface RegisteredDescriptor {
   id: string;
   name: string;
   format: 'descriptor_set' | 'proto_source';
   services: DescriptorServiceInfo[];
+  source: DescriptorSource;
   createdAt: string;
 }
 
@@ -92,7 +108,12 @@ export class DescriptorRegistry {
    * proto source for proto_source. Throws DescriptorError when the input
    * cannot be parsed or defines no service (spec 4.7.3 validation).
    */
-  add(input: { name: string; format: 'descriptor_set' | 'proto_source'; content: string }): RegisteredDescriptor {
+  add(input: {
+    name: string;
+    format: 'descriptor_set' | 'proto_source';
+    content: string;
+    source?: DescriptorSource;
+  }): RegisteredDescriptor {
     let root: protobuf.Root;
     if (input.format === 'descriptor_set') {
       let bytes: Buffer;
@@ -143,6 +164,7 @@ export class DescriptorRegistry {
       name: input.name,
       format: input.format,
       services,
+      source: input.source ?? { type: 'upload' },
       createdAt: new Date().toISOString(),
     };
     this.stored.set(info.id, { info, root });
@@ -151,6 +173,31 @@ export class DescriptorRegistry {
 
   remove(id: string): boolean {
     return this.stored.delete(id);
+  }
+
+  /** Removes every descriptor matching `predicate`; returns the removed ids. */
+  removeWhere(predicate: (info: RegisteredDescriptor) => boolean): string[] {
+    const removed: string[] = [];
+    for (const [id, { info }] of this.stored) {
+      if (predicate(info)) {
+        this.stored.delete(id);
+        removed.push(id);
+      }
+    }
+    return removed;
+  }
+
+  /** Whether any registered descriptor defines the service `fullName` (e.g. `pkg.Svc`). */
+  hasService(fullName: string): boolean {
+    for (const { root } of this.stored.values()) {
+      try {
+        root.lookupService(fullName);
+        return true;
+      } catch {
+        // not in this root
+      }
+    }
+    return false;
   }
 
   get(id: string): RegisteredDescriptor | undefined {
