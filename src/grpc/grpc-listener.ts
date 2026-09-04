@@ -6,7 +6,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { MessageDraft, TimingInfo, TrafficEventDraft } from '../logging/traffic-log.js';
 import { applyDelay, applyResponseReplace, applyRewriteOperations } from '../proxy/actions.js';
 import { readBodyUpTo } from '../proxy/body.js';
-import { fromNodeHeaders, headerValue, stripHopByHop } from '../proxy/headers.js';
+import { fromHttp2Headers, headerValue, stripHopByHop } from '../proxy/headers.js';
 import { applyGrpcResponsePatch, InvalidPatchError } from '../proxy/patch.js';
 import type { StartedListener } from '../proxy/http-listener.js';
 import type { ProxyRuntime } from '../proxy/pipeline.js';
@@ -1300,14 +1300,21 @@ async function handleStreaming(runtime: GrpcRuntime, ctx: StreamContext): Promis
  */
 export function grpcStreamHandler(
   runtime: GrpcRuntime,
-): (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => void {
+): (
+  stream: http2.ServerHttp2Stream,
+  headers: http2.IncomingHttpHeaders,
+  flags?: number,
+  rawHeaders?: string[],
+) => void {
   const { appLog } = runtime;
-  return (stream, headers) => {
+  return (stream, headers, _flags, rawHeaders) => {
     const ctx: StreamContext = {
       stream,
       path: String(headers[':path'] ?? '/'),
       authority: String(headers[':authority'] ?? headers['host'] ?? ''),
-      metadata: fromNodeHeaders(headers),
+      // Repeated metadata (e.g. two values of one -bin key) must stay separate
+      // fields; the joined headers object would corrupt them (spec 4.1.1).
+      metadata: fromHttp2Headers(headers, rawHeaders),
       client: (() => {
         const socket = stream.session?.socket;
         return socket ? `${socket.remoteAddress ?? 'unknown'}:${socket.remotePort ?? 0}` : 'unknown';

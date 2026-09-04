@@ -1,7 +1,7 @@
 import http from 'node:http';
 import http2 from 'node:http2';
 import net from 'node:net';
-import { fromNodeHeaders, toOutgoingHeaders } from './headers.js';
+import { fromHttp2Headers, fromNodeHeaders, toOutgoingHeaders } from './headers.js';
 import { parseUpstream } from './upstream.js';
 import { handleHttpExchange, type HttpExchange, type ProxyRuntime } from './pipeline.js';
 
@@ -71,13 +71,17 @@ export function h1Exchange(req: http.IncomingMessage, res: http.ServerResponse):
   };
 }
 
-export function h2Exchange(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders): HttpExchange {
+export function h2Exchange(
+  stream: http2.ServerHttp2Stream,
+  headers: http2.IncomingHttpHeaders,
+  rawHeaders?: string[],
+): HttpExchange {
   let responded = false;
   return {
     method: String(headers[':method'] ?? 'GET'),
     rawPath: String(headers[':path'] ?? '/'),
     authority: String(headers[':authority'] ?? headers['host'] ?? ''),
-    headers: fromNodeHeaders(headers),
+    headers: fromHttp2Headers(headers, rawHeaders),
     bodyStream: stream,
     client: clientOf(stream.session?.socket as net.Socket),
     respond(status, outHeaders, body) {
@@ -187,8 +191,8 @@ export function startHttpListener(runtime: ProxyRuntime): Promise<StartedListene
   });
 
   const http2Server = http2.createServer();
-  http2Server.on('stream', (stream, headers) => {
-    handleHttpExchange(runtime, h2Exchange(stream, headers)).catch((err: unknown) => {
+  http2Server.on('stream', (stream, headers, _flags, rawHeaders) => {
+    handleHttpExchange(runtime, h2Exchange(stream, headers, rawHeaders)).catch((err: unknown) => {
       handleError(err, 'h2 handler');
       if (!stream.headersSent && !stream.destroyed) {
         try {
