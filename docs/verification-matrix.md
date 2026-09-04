@@ -2,7 +2,7 @@
 
 docs/spec.md の各要件について「実装 → unit test → 実機/UI 検証」の対応を示す。
 
-- **Unit**: 該当機能を検証する vitest テスト(合計 296 件 / 22 ファイル、`npm test`)
+- **Unit**: 該当機能を検証する vitest テスト(合計 297 件 / 22 ファイル、`npm test`)
 - **GKE**: GCP `<GCP_PROJECT_ID>`(ms-a 両方向サイドカー)での実 traffic 検証
 - **UI**: playwright-mcp による実デプロイの UI 操作検証
 

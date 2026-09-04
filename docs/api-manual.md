@@ -794,7 +794,8 @@ config で常設・自動化できます(spec 4.13):
 {
   "listeners": [
     { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1", "port": 15052, "mode": "connect",
-      // 起動時に取得(upstream 未起動なら backoff で再試行、起動はブロックしない)
+      // 起動時に取得。upstream 未起動なら backoff(1s,2s,4s,8s,16s,30s…)で最大 10 回
+      // 再試行し、それでも取れなければ error ログを出して諦める。起動はブロックしない
       "descriptors": [{ "reflect": "ms-b:50052" }] }
   ],
   "reflection": {

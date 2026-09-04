@@ -443,7 +443,7 @@ Filter 例:
 - `grpcService=demo.TimeService`
 - `grpcMethod=Now`
 - `ruleId=...`
-- `outcome=captured|mock|fault|modified|delayed|upstream_error|rule_error`
+- `outcome=captured|mock|fault|modified|delayed|upstream_error|rule_error|client_aborted`
 - `from` / `to`
 - `statusCode`
 - `grpcStatus`
@@ -1180,7 +1180,7 @@ descriptor の入手を手作業(protoc / buf でのビルドとアップロー�
 
 0. **観測済み upstream への one-shot**: proxy は転送した gRPC call の upstream(CONNECT authority、または reverse listener の設定 `upstream`)を、descriptor の有無に関わらず記録する(`GET /_morpheus/api/v1/grpc/reflection` の `observed`。target 数と service 数には上限がある)。`POST /_morpheus/api/v1/grpc/descriptors:reflect-all`(body 省略可。`{ "onlyMissing": false }` で全 target を再取得)は、その全 target に対して取得を行い、target ごとの結果(`imported` / `failed` / `skipped`)を `200` で返す。既定では descriptor の無い service を持つ target だけを対象にし、`reflection.allow` に一致しない target は skip する。UI の gRPC Descriptors 画面のボタンはこれを呼ぶ
 1. **明示**: `POST /_morpheus/api/v1/grpc/descriptors:reflect` に `{ "target": "host:port", "symbols"?: [...], "timeoutMs"?: n }`。成功時は 4.7.3 と同じ descriptor 情報を `201` で返す。失敗は `reflection_failed`(`invalid_target` は `400`、upstream 起因は `502`)で、`details[].reason` に `unimplemented` / `unavailable` / `timeout` / `rejected` / `not_found` / `no_services` / `too_large` / `invalid` のいずれかを入れる
-2. **起動時**: listener の `descriptors` に `{ "reflect": "host:port", "symbols"?: [...] }` を書く。upstream が未起動でも起動をブロックせず、backoff 付きで再試行する(4.13)
+2. **起動時**: listener の `descriptors` に `{ "reflect": "host:port", "symbols"?: [...] }` を書く。upstream が未起動でも起動をブロックせず、失敗したら 1s → 2s → 4s → 8s → 16s → 30s → 30s … の backoff で再試行する。試行は **最大 10 回**(初回を含む。約 2.5 分)で、それでも取れなければ error ログ(`config: reflection descriptor import gave up`)を出して起動時取込は打ち切る。この上限は固定で設定項目にしない。打ち切り後の回復は自動取込(`reflection.auto`)、one-shot(`descriptors:reflect-all`)、明示取込のいずれかで行う
 3. **自動**(`reflection.auto: true`、既定は off): descriptor 未登録の method(`/pkg.Service/Method`)を見た時点で、その upstream への import を **バックグラウンドで** 起動する。当該 request は従来どおり streaming として素通し(4.7.5)、以降の request から unary 判定・decode・body logging・mock・manipulation が効く。同じ target への import は single-flight で 1 回にまとめ、失敗した target は `negativeTtlMs` の間は再試行しない。target が応答したが該当 service を持たない場合も同じ期間は再問い合わせしない。`reflection.allow`(authority の glob)に一致しない target には問い合わせない
 
 制約:
@@ -1349,11 +1349,12 @@ Traffic log entry は capture / intercepted / fault / mock / manipulated traffic
 | `delayed` | delay のみ適用した |
 | `upstream_error` | upstream 障害により proxy が response を生成した |
 | `rule_error` | script error などにより rule 適用に失敗し passthrough した |
+| `client_aborted` | client が応答前に接続 / stream を中断した。stream が閉じる前に body が完了しなかった場合に加え、body が `content-length` より短いまま終わった HTTP request、gRPC frame の途中で終わった unary request も同じ扱い(不完全な request は転送しない)。rule は通常どおり priority 順に評価・消費し、attempt を 1 回だけ記録する |
 
 - 複数が該当する場合の優先順位は `mock` / `fault` > `modified` > `delayed` > `captured` とする(例: fault + delay は `fault`、改変 + delay は `modified`)
 - intercept rule に一致したが `response.match` が不一致で改変が行われなかった場合、outcome は `captured` とし、`matchedRules` に response 条件が不一致だった旨を記録する
 
-`loggingReason` の値: `capture_rule` / `matched_rule` / `upstream_error` / `rule_error`
+`loggingReason` の値: `capture_rule` / `matched_rule` / `upstream_error` / `rule_error` / `client_aborted`
 
 #### 4.9.2 保存対象
 
@@ -1496,7 +1497,7 @@ Config 読み込み要件:
 - config file が存在しない、読めない、JSONC parse に失敗した場合は、hard coded default 全体で起動し、warning を application log と stderr に出す
 - config の一部の key が schema validation に失敗した場合は、その key だけ hard coded default に fallback し、warning を出す。validation に成功した key はその値を使用する
 - 参照 descriptor file が読めない場合は、その descriptor だけ skip して warning を出し、起動は継続する
-- `descriptors` の reflection 指定(`{ "reflect": "host:port" }`、4.7.6)は起動をブロックせず、upstream に到達できるまで backoff 付きで再試行する
+- `descriptors` の reflection 指定(`{ "reflect": "host:port" }`、4.7.6)は起動をブロックせず、backoff 付きで最大 10 回まで再試行し、その後は諦めて error ログを出す(readiness には影響しない)
 - env var による override は config path などの deployment-specific な項目に限定する
 
 ```jsonc
