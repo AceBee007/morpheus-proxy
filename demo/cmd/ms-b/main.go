@@ -11,6 +11,7 @@ import (
 
 	"morpheus-proxy/demo/internal/rpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -45,6 +46,9 @@ func main() {
 	service := timeServer{}
 	rpc.RegisterTimeServer(server, service)
 	rpc.RegisterAnimalSoundServer(server, service)
+	// Server reflection lets morpheus import this server's descriptors itself
+	// (docs/spec.md 4.7.6) — the same mechanism grpcurl / buf curl rely on.
+	reflection.Register(server)
 
 	log.Printf("ms-b time grpc listening on %s", addr)
 	if err := server.Serve(listener); err != nil {
