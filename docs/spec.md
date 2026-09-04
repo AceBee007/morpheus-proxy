@@ -150,6 +150,7 @@ Control plane は管理 API と Web UI を提供する。管理 API は proxy li
 - 転送時に header は原則そのまま維持する。`X-Forwarded-For` / `Via` などの proxy header は付与しない
 - hop-by-hop header(`Connection`、`Keep-Alive`、`Proxy-Connection`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`)は RFC 9110 に従い、転送する接続に合わせて処理する
 - `Host` / `:authority` は書き換えずそのまま upstream に送る
+- 同名の header field が複数ある場合(HTTP/2 の repeated header、gRPC で同じ key の metadata が複数値、特に base64 の `-bin` metadata)は `", "` で結合せず、受け取った field ごとに個別に転送する。結合すると `-bin` 値の base64 が壊れ、受け側の gRPC 実装が `malformed binary metadata` として request を拒否するため。response header / trailer も同様
 - HTTP/1.1 chunked trailer、HTTP/2 trailer は passthrough する
 - WebSocket / `Upgrade` request は rule 適用対象外とし、バイト単位で passthrough する
 - 本仕様で挙動が言及されていない traffic / 要素は、原則として何もせず passthrough する

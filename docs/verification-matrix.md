@@ -2,7 +2,7 @@
 
 docs/spec.md の各要件について「実装 → unit test → 実機/UI 検証」の対応を示す。
 
-- **Unit**: 該当機能を検証する vitest テスト(合計 297 件 / 22 ファイル、`npm test`)
+- **Unit**: 該当機能を検証する vitest テスト(合計 304 件 / 24 ファイル、`npm test`)
 - **GKE**: GCP `<GCP_PROJECT_ID>`(ms-a 両方向サイドカー)での実 traffic 検証
 - **UI**: playwright-mcp による実デプロイの UI 操作検証
 
@@ -12,6 +12,7 @@ docs/spec.md の各要件について「実装 → unit test → 実機/UI 検�
 | spec | 実装 | Unit test | GKE / UI 実機検証 |
 | --- | --- | --- | --- |
 | 4.1.1 透過転送 | `src/proxy/pipeline.ts`, `http-listener.ts` | `proxy.integration.test.ts`(transparent forwarding, hop-by-hop, Host 保持) | GKE: ms-b→ms-a /echo が素通しで 200 |
+| 4.1.1 同名 header field の個別転送(gRPC `-bin` metadata 含む) | `proxy/headers.ts`(`fromRawHeaders`)、`grpc/grpc-listener.ts`、`proxy/upstream.ts`、`proxy/http-listener.ts` | `headers.test.ts`、`metadata.integration.test.ts`(同 key の -bin 2 値を request / response metadata / trailer で往復、streaming と unary の両経路) | dev 実機で `malformed binary metadata` により失敗した request を根拠に修正 |
 | 4.1.2 upstream 障害応答 | `pipeline.ts`, `upstream.ts` | `proxy.integration.test.ts`(502/504 + x-morpheus-error) | GKE: upstream down → 502(前環境検証、実装同一) |
 | 4.1.3 trace id | `pipeline.ts` | (metadata 経路) | — |
 | 4.1.4 / 4.9 ログ保存方針 | `logging/traffic-log.ts` | `traffic-log.test.ts` | GKE: unmatched 非記録、capture のみ記録を確認 |
