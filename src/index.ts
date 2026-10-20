@@ -161,6 +161,15 @@ async function main(): Promise<void> {
   // Built UI assets are served by the admin server when present (spec 3.4)
   const uiDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'ui', 'dist');
 
+  // Basic auth for the admin API / UI: opt-in via env, like MORPHEUS_CONFIG (spec 4.13)
+  const envPassword = process.env['MORPHEUS_ADMIN_PASSWORD'];
+  const adminPassword = envPassword !== undefined && envPassword !== '' ? envPassword : undefined;
+  if (adminPassword === undefined && !['127.0.0.1', 'localhost', '::1'].includes(config.admin.host)) {
+    appLog.warn('admin API is reachable beyond loopback without authentication; set MORPHEUS_ADMIN_PASSWORD', {
+      host: config.admin.host,
+    });
+  }
+
   const adminServer: AdminServer = await startAdminServer({
     config,
     ruleStore,
@@ -179,6 +188,7 @@ async function main(): Promise<void> {
     manipulatorRunner,
     scriptSandboxStatus: () => sandbox.status(),
     ...(existsSync(uiDir) ? { uiDir } : {}),
+    ...(adminPassword !== undefined ? { adminPassword } : {}),
   });
 
   const retention = startRetentionLoop({

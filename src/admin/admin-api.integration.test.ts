@@ -819,3 +819,45 @@ message NowResponse { string iso = 1; }
     expect((await stack.api('/api/v1/grpc/descriptors:reflect-all', json({}))).status).toBe(400);
   });
 });
+
+describe('admin hardening (auth, origin, content-type)', () => {
+  const basic = (password: string): string => `Basic ${Buffer.from(`:${password}`).toString('base64')}`;
+
+  it('requires Basic auth when a password is configured, except for health probes', async () => {
+    const upstream = await startTestUpstream();
+    cleanups.push(() => upstream.close());
+    const stack = await startTestStack({ upstream: upstream.url, adminPassword: 's3cret' });
+    cleanups.push(() => stack.close());
+
+    const denied = await stack.api('/api/v1/status');
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get('www-authenticate')).toContain('Basic');
+    const wrong = await stack.api('/api/v1/status', { headers: { authorization: basic('wrong') } });
+    expect(wrong.status).toBe(401);
+    const ok = await stack.api('/api/v1/status', { headers: { authorization: basic('s3cret') } });
+    expect(ok.status).toBe(200);
+    expect((await stack.api('/healthz/live')).status).toBe(200);
+    expect((await stack.api('/healthz/ready')).status).toBe(200);
+  });
+
+  it('rejects cross-origin requests and accepts same-origin ones', async () => {
+    const { stack } = await setup();
+    const evil = await stack.api('/api/v1/status', { headers: { origin: 'http://evil.example' } });
+    expect(evil.status).toBe(403);
+    const sameOrigin = new URL(stack.adminUrl).origin;
+    const same = await stack.api('/api/v1/status', { headers: { origin: sameOrigin } });
+    expect(same.status).toBe(200);
+    expect((await stack.api('/api/v1/status')).status).toBe(200);
+  });
+
+  it('rejects JSON bodies sent with a non-JSON content type (415)', async () => {
+    const { stack } = await setup();
+    const plain = await stack.api('/api/v1/rules', {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: JSON.stringify(captureRule('r-plain')),
+    });
+    expect(plain.status).toBe(415);
+    expect((await stack.api('/api/v1/rules', json(captureRule('r-json')))).status).toBe(201);
+  });
+});

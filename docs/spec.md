@@ -228,7 +228,8 @@ Pagination(list 系 endpoint 共通):
 
 認証:
 
-- 管理 API に認証は設けない(非目標参照)。既定 bind は `127.0.0.1` とし、必要な場合のみ config で変更する
+- 既定では認証なし(非目標参照)。env `MORPHEUS_ADMIN_PASSWORD` を設定すると `/healthz/*` 以外の全エンドポイントに HTTP Basic 認証(user 名は任意)を要求する。既定 bind は `127.0.0.1` とし、必要な場合のみ config で変更する
+- `Origin` ヘッダが `Host` と一致しない request は `403` で拒否する(ブラウザからの cross-site request 対策)。body を持つ request は `content-type: application/json` 必須で、それ以外は `415`
 
 #### 4.2.2 Health
 
@@ -733,6 +734,7 @@ Security / 実行制御:
 - script matcher / manipulator は初期仕様からサポートする
 - script は proxy 本体とは別の sandbox subprocess(Node.js)で実行する
 - sandbox では `fs` / `net` / `process` / filesystem access / dynamic import を禁止する
+- sandbox subprocess は Node の permission model(`--permission`)で起動する。vm context から脱出されても filesystem / child process / worker へのアクセスは `ERR_ACCESS_DENIED` になる(network と env は対象外)
 - 1 回の実行 timeout は rule ごとに `timeoutMs` で設定できる。既定は 3 秒(config `script.defaultTimeoutMs`)。ユーザーが明示的に設定した場合はその値に従う(上限は config `script.maxTimeoutMs`、既定 60 秒)
 - script の compile error / runtime error / timeout は rule execution failure として traffic log と application log の両方に残す
 - script error / timeout が発生した場合、その rule は request / response を編集せず passthrough する
@@ -1459,8 +1461,8 @@ Retention 超過時は古い log から削除する。削除は metadata、reque
 
 セキュリティ方針:
 
-- dev 環境での利用を前提とし、管理 API / UI の認証は設けない(非目標参照)
-- 管理 API は既定で `127.0.0.1` に bind する。remote からのアクセスが必要な場合のみ config で bind host を変更する
+- dev 環境での利用を前提とし、管理 API / UI の認証は既定で無効。多層防御として env `MORPHEUS_ADMIN_PASSWORD` による HTTP Basic 認証を有効化できる(4.2.1)
+- 管理 API と listener は既定で `127.0.0.1` に bind する。remote / 他 Pod からのアクセスが必要な場合のみ config で bind host を変更する(inbound reverse listener は `0.0.0.0` が必要)
 - UI から script rule を登録する場合は明示的な confirmation を要求する
 - CORS、security headers などは一般的な best practice に従う。UI と管理 API は同一 origin(admin port)で提供されるため CORS は既定 disabled とする
 
@@ -1499,7 +1501,7 @@ Config 読み込み要件:
 - config の一部の key が schema validation に失敗した場合は、その key だけ hard coded default に fallback し、warning を出す。validation に成功した key はその値を使用する
 - 参照 descriptor file が読めない場合は、その descriptor だけ skip して warning を出し、起動は継続する
 - `descriptors` の reflection 指定(`{ "reflect": "host:port" }`、4.7.6)は起動をブロックせず、backoff 付きで最大 10 回まで再試行し、その後は諦めて error ログを出す(readiness には影響しない)
-- env var による override は config path などの deployment-specific な項目に限定する
+- env var による override は config path などの deployment-specific な項目に限定する(`MORPHEUS_CONFIG`、`MORPHEUS_ADMIN_PASSWORD`)
 
 ```jsonc
 {
@@ -1513,7 +1515,7 @@ Config 読み込み要件:
     {
       "name": "http",
       "protocol": "http",
-      "host": "0.0.0.0",
+      "host": "127.0.0.1",
       "port": 18080,
       "upstream": "http://127.0.0.1:8080",
       "decodeBody": false,
@@ -1523,7 +1525,7 @@ Config 読み込み要件:
     {
       "name": "grpc",
       "protocol": "grpc",
-      "host": "0.0.0.0",
+      "host": "127.0.0.1",
       "port": 15051,
       "upstream": "h2c://127.0.0.1:50051",
       // Descriptors are required for gRPC body decode/edit: file paths, or

@@ -6,8 +6,8 @@ inspect / manipulate できるようにする**手順をまとめたものです
 demo の `ms-a` への導入実績を一般化しています(GKE + Istio 実機での検証記録は
 [verification-matrix.md](verification-matrix.md) と [tmp/setup-morpheus-proxy-worklog.md](../tmp/setup-morpheus-proxy-worklog.md))。
 
-> **対象は dev 環境のみ。** morpheus は認証を持たず、admin API から挙動を自由に変えられます。
-> 本番・ステージングには入れないでください。
+> **対象は dev 環境のみ。** morpheus の admin API から挙動を自由に変えられます(既定は認証なし。
+> `MORPHEUS_ADMIN_PASSWORD` で Basic 認証を有効化できます)。本番・ステージングには入れないでください。
 
 ## 1. 仕組み(CONNECT 方式)
 
@@ -83,7 +83,8 @@ metadata:
 data:
   morpheus.jsonc: |
     {
-      "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
+      // admin も loopback。kubectl port-forward は Pod 内の localhost に繋ぐので 0.0.0.0 は不要
+      "admin": { "host": "127.0.0.1", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
         // app の下流呼び出し(gRPC)をまとめて受ける CONNECT egress listener
         { "name": "grpc-egress", "protocol": "grpc", "host": "127.0.0.1", "port": 15052,
@@ -95,7 +96,12 @@ data:
       // 下流が gRPC server reflection を公開していれば、descriptor は morpheus が
       // 下流から自動取得する(spec 4.7.6)。手動の proto 登録は不要になる
       "reflection": { "auto": true },
-      "logging": { "trafficLogDir": "/tmp/morpheus/traffic", "appLogDir": "/tmp/morpheus/app" }
+      // log の保持は dev でも必要最小限に(件数 / bytes / 期間。値は環境ごとに調整)
+      "logging": {
+        "trafficLogDir": "/tmp/morpheus/traffic", "appLogDir": "/tmp/morpheus/app",
+        "trafficMaxEntries": 1000, "trafficMaxBytes": 20971520,
+        "trafficRetentionMs": 3600000, "appRetentionMs": 3600000
+      }
     }
 ```
 
@@ -112,7 +118,8 @@ data:
 ## 4. Deployment にサイドカーを追加
 
 app の Deployment に morpheus コンテナと ConfigMap volume を追加します。
-公開が必要なポートは admin (18081) だけです(CONNECT listener は loopback 専用)。
+admin (18081) も CONNECT listener も loopback 専用なので、Pod の外に公開するポートはありません
+(admin は port-forward で使う)。probe は Pod IP 宛の `httpGet` では届かないため `exec` にします。
 
 ```yaml
 spec:
@@ -127,15 +134,15 @@ spec:
           env:
             - name: MORPHEUS_CONFIG
               value: /etc/morpheus/morpheus.jsonc
-          ports:
-            - { name: mp-admin, containerPort: 18081 }   # admin API / Web UI
-            # connect listener(15052)は loopback 専用なので containerPort に出さない
+            - name: MORPHEUS_ADMIN_PASSWORD      # admin API / UI の Basic 認証(任意、推奨)
+              valueFrom: { secretKeyRef: { name: morpheus-proxy-admin, key: password } }
+          # admin(18081)も connect listener(15052)も loopback 専用なので containerPort は不要
           readinessProbe:
-            httpGet: { path: /_morpheus/healthz/ready, port: 18081 }
+            exec: { command: ["wget", "-qO-", "http://127.0.0.1:18081/_morpheus/healthz/ready"] }
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet: { path: /_morpheus/healthz/live, port: 18081 }
+            exec: { command: ["wget", "-qO-", "http://127.0.0.1:18081/_morpheus/healthz/live"] }
             initialDelaySeconds: 5
             periodSeconds: 20
           volumeMounts:
@@ -148,8 +155,9 @@ spec:
           configMap: { name: morpheus-proxy-config }
 ```
 
-Service は**変更しません**(admin/UI を in-cluster から触りたい場合のみ、任意で
-`{ name: mp-admin, port: 18081, targetPort: 18081 }` を足す)。
+Service は**変更しません**。admin/UI を他 Pod から触る必要がある場合だけ、config の
+`admin.host` を `0.0.0.0` にして Service に `{ name: mp-admin, port: 18081, targetPort: 18081 }` を
+足します(その場合は `MORPHEUS_ADMIN_PASSWORD` を必ず設定する)。
 
 ## 5. app に proxy 設定を足す(唯一の app 側変更)
 
@@ -263,6 +271,10 @@ kubectl --context=$CTX -n <NAMESPACE> port-forward $POD 18081:18081
 # ブラウザで http://localhost:18081/_morpheus/ （React UI）
 ```
 
+admin が loopback bind でも port-forward は届きます(kubectl は Pod の network namespace 内で
+localhost に接続する)。`MORPHEUS_ADMIN_PASSWORD` を設定している場合、ブラウザは認証ダイアログを
+出すので user 名は空のままパスワードを入れます。curl は `-u ":<password>"` を付けます。
+
 ### admin API 操作の注意
 
 - morpheus コンテナは Node イメージで、`wget`(busybox)には **DELETE がありません**。
@@ -281,7 +293,10 @@ ConfigMap volume を外して apply するだけです。下流アドレスも S
 
 ## 10. 制約・注意
 
-- **dev 専用**: 認証なし。Service に admin ポートを載せる場合も mesh 内限定にすること。
+- **dev 専用**: 既定は認証なし・loopback bind。`MORPHEUS_ADMIN_PASSWORD` で Basic 認証を
+  有効化できる。Service に admin ポートを載せる場合は認証を必須にし、mesh 内限定にすること。
+- **ブラウザからの cross-site request は拒否**: `Origin` が `Host` と一致しない request は 403、
+  body 付き request は `content-type: application/json` 必須(それ以外は 415)。
 - **opt-in**: proxy 設定を入れた client の通信だけが morpheus を通る。設定しない client は
   素通り(傍受されない)。漏れなく捕捉したい要件には `EnvoyFilter` / iptables の透過捕捉が
   必要だが、本 proxy の対象外(spec 2.3)。

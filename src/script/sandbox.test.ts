@@ -241,3 +241,16 @@ describe('script rules end-to-end (spec 4.4.3, 4.5.6)', () => {
     expect(entry?.ruleErrors?.[0]?.error).toContain('timed out');
   });
 });
+
+describe('ScriptSandbox worker runs under the Node permission model', () => {
+  it('denies file system and child process access even after a vm context escape', async () => {
+    const sandbox = makeSandbox();
+    const escape = "const p = this.constructor.constructor('return process')();";
+    await expect(
+      sandbox.run(`${escape} return p.getBuiltinModule('node:fs').readFileSync('/etc/hostname', 'utf8');`, {}),
+    ).rejects.toThrow(/restricted|ERR_ACCESS_DENIED/);
+    await expect(
+      sandbox.run(`${escape} return p.getBuiltinModule('node:child_process').execSync('id').toString();`, {}),
+    ).rejects.toThrow(/restricted|ERR_ACCESS_DENIED/);
+  });
+});

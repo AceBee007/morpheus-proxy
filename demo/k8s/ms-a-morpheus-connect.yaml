@@ -21,7 +21,7 @@ metadata:
 data:
   morpheus.jsonc: |
     {
-      "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
+      "admin": { "host": "127.0.0.1", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
         {
           "name": "grpc-egress",
@@ -112,20 +112,17 @@ spec:
           env:
             - name: MORPHEUS_CONFIG
               value: /etc/morpheus/morpheus.jsonc
-          ports:
-            - name: mp-admin
-              containerPort: 18081
-            # the CONNECT listener (15052) is loopback-only, not a Service port
+          # admin (18081) and the CONNECT listener (15052) are loopback-only: reach the
+          # admin API / UI with kubectl port-forward. Probes must therefore use exec
+          # (kubelet httpGet probes target the pod IP).
           readinessProbe:
-            httpGet:
-              path: /_morpheus/healthz/ready
-              port: 18081
+            exec:
+              command: ["wget", "-qO-", "http://127.0.0.1:18081/_morpheus/healthz/ready"]
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /_morpheus/healthz/live
-              port: 18081
+            exec:
+              command: ["wget", "-qO-", "http://127.0.0.1:18081/_morpheus/healthz/live"]
             initialDelaySeconds: 5
             periodSeconds: 20
           volumeMounts:
@@ -165,7 +162,4 @@ spec:
     - name: grpc
       port: 50051
       targetPort: 50051
-    # optional: reach the morpheus admin API / UI in-cluster
-    - name: mp-admin
-      port: 18081
-      targetPort: 18081
+    # the morpheus admin API / UI is loopback-only (use kubectl port-forward)

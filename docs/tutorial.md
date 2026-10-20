@@ -69,7 +69,8 @@ POD=$(kubectl --context=$CTX -n $NS get pods -l <APP_LABEL> -o jsonpath='{.items
 kubectl --context=$CTX -n $NS port-forward pod/$POD 18081:18081 8080:8080
 ```
 
-別ターミナルで(Step 0 の変数を再定義してから):
+別ターミナルで(Step 0 の変数を再定義してから)。環境に `MORPHEUS_ADMIN_PASSWORD` が設定されて
+いる場合は、healthz 以外の curl に `-u ":<password>"` を付けます:
 
 ```sh
 curl -s http://localhost:18081/_morpheus/healthz/ready          # {"status":"ready"}

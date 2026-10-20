@@ -28,7 +28,17 @@ kubectl --context=<context> -n <namespace> exec <pod> -c morpheus-proxy -- \
 kubectl --context=<context> -n <namespace> port-forward pod/<pod> 18081:18081
 ```
 
-管理 API / UI には認証がありません。dev 環境だけで使い、remote 公開する場合は公開範囲を制限してください。
+admin が既定の loopback bind でも port-forward は届きます。管理 API / UI は既定では認証なしですが、
+env `MORPHEUS_ADMIN_PASSWORD` が設定された環境では `/healthz/*` 以外に HTTP Basic 認証が必要です
+(user 名は任意)。以下の curl 例にはその場合 `-u ":<password>"` を付けてください。
+
+```sh
+curl -s -u ":$MORPHEUS_ADMIN_PASSWORD" "$A/status" | jq .
+```
+
+body を送る request は `content-type: application/json` が必須(それ以外は `415`)、`Origin` ヘッダが
+`Host` と一致しない request は `403` になります(ブラウザからの cross-site request 対策。curl は影響なし)。
+dev 環境だけで使い、remote 公開する場合は公開範囲を制限してください。
 
 ## 2. 共通仕様
 
