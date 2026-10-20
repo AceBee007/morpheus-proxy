@@ -77,6 +77,10 @@ export function h2Exchange(
   rawHeaders?: string[],
 ): HttpExchange {
   let responded = false;
+  stream.on('error', () => {
+    /* client RST_STREAM / GOAWAY with an error code: unhandled it would crash the
+       process; the 'close' handlers in the pipeline do the cleanup */
+  });
   return {
     method: String(headers[':method'] ?? 'GET'),
     rawPath: String(headers[':path'] ?? '/'),

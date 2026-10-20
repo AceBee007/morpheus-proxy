@@ -7,7 +7,7 @@ export function defaultHttpListener(): ListenerConfig {
   return {
     name: 'http',
     protocol: 'http',
-    host: '0.0.0.0',
+    host: '127.0.0.1',
     port: DEFAULT_HTTP_LISTENER_PORT,
     upstream: 'http://127.0.0.1:8080',
     decodeBody: false,
@@ -21,7 +21,7 @@ export function defaultGrpcListener(): ListenerConfig {
   return {
     name: 'grpc',
     protocol: 'grpc',
-    host: '0.0.0.0',
+    host: '127.0.0.1',
     port: DEFAULT_GRPC_LISTENER_PORT,
     upstream: 'h2c://127.0.0.1:50051',
     decodeBody: false,

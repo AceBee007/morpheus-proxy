@@ -50,6 +50,11 @@ export async function readJsonBody(req: IncomingMessage): Promise<unknown> {
     chunks.push(chunk as Buffer);
   }
   if (total === 0) return undefined;
+  // Non-JSON content types are what browsers may send cross-site without a CORS
+  // preflight; refusing them keeps every write a preflighted (and thus blocked) request.
+  if (!/^application\/json\b/i.test(req.headers['content-type'] ?? '')) {
+    throw new ApiError(415, 'unsupported_media_type', 'request body must be application/json');
+  }
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {

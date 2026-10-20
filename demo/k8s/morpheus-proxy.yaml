@@ -10,7 +10,9 @@ metadata:
 data:
   morpheus.jsonc: |
     {
-      // admin bound to 0.0.0.0 for in-cluster access / port-forward (dev only)
+      // admin bound to 0.0.0.0 only because this standalone Deployment is reached
+      // through its Service; port-forward alone works with the loopback default.
+      // Set MORPHEUS_ADMIN_PASSWORD when exposing admin like this (dev only).
       "admin": { "host": "0.0.0.0", "port": 18081, "basePath": "/_morpheus" },
       "listeners": [
         {
