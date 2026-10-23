@@ -8,7 +8,7 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 
 ## Overview
 
-- **Runtime**: Node.js 24 LTS + TypeScript, ESM (`moduleResolution: NodeNext`)
+- **Runtime**: Node.js 26 LTS + TypeScript, ESM (`moduleResolution: NodeNext`)
 - **Data plane**: HTTP/1.1, HTTP/2 (h2c), gRPC unary + streaming
 - **Control plane**: JSON admin API + React SPA on a dedicated admin port
 - **Deployment model**: a sidecar next to the app, coexisting with the istio
@@ -62,6 +62,14 @@ a warning; the app never fails to start on config problems.
 
 [config/default.jsonc](config/default.jsonc) documents every setting and is
 kept identical to the hard-coded defaults (verified by a test).
+
+Security defaults (dev-only tool): the admin server and all listeners bind to
+`127.0.0.1` unless configured otherwise; `kubectl port-forward` still reaches
+them. Setting `MORPHEUS_ADMIN_PASSWORD` enables HTTP Basic auth on everything
+except `/healthz/*`. Cross-origin browser requests (`Origin` ≠ `Host`) are
+rejected with 403 and request bodies must be `application/json`. The container
+runs as the unprivileged `node` user and the script sandbox worker runs under
+Node's permission model (`--permission`).
 
 Endpoints (default base path `/_morpheus`, admin port `18081`):
 

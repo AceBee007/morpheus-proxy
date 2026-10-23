@@ -821,3 +821,32 @@ describe('gRPC attempt logging is guaranteed exactly once (client_aborted)', () 
     expect(retry?.matchedRules.map((m) => m.id)).toEqual(['cap-all']);
   }, 10_000);
 });
+
+describe('client protocol errors do not take the proxy down', () => {
+  it('survives a client GOAWAY(PROTOCOL_ERROR) sent right after the request headers', async () => {
+    const { proxy, client } = await setupGrpcProxy();
+    // A raw h2 client that misbehaves: opens a stream, then tears the session
+    // down with an error code. Node surfaces that as 'error' on the server
+    // stream; before the fix this was an uncaught exception in the proxy.
+    const raw = http2.connect(`http://127.0.0.1:${proxy.port}`);
+    raw.on('error', () => {
+      /* expected: we close the session with an error code ourselves */
+    });
+    const stream = raw.request({
+      ':method': 'POST',
+      ':path': '/demo.TimeService/Now',
+      'content-type': 'application/grpc',
+      te: 'trailers',
+    });
+    stream.on('error', () => {
+      /* expected */
+    });
+    raw.goaway(http2.constants.NGHTTP2_PROTOCOL_ERROR);
+    await sleep(50);
+    raw.destroy();
+
+    const { response, error } = await callNow(client);
+    expect(error).toBeUndefined();
+    expect(response?.source).toBe('real');
+  });
+});

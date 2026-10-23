@@ -18,7 +18,9 @@ kubectl --context=<context> -n <namespace> port-forward pod/<pod> 18081:18081
 open http://localhost:18081/_morpheus/
 ```
 
-UI は admin API と同じ origin から配信されます。認証はありません。dev 環境だけで使ってください。
+UI は admin API と同じ origin から配信されます。既定では認証なし、環境に `MORPHEUS_ADMIN_PASSWORD` が
+設定されていればブラウザの Basic 認証ダイアログが出ます(user 名は空のままパスワードだけ入力)。
+dev 環境だけで使ってください。
 
 ## 2. 共通の考え方
 

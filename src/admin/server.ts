@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
@@ -53,6 +54,8 @@ export interface AdminContext {
   scriptSandboxStatus?: () => unknown;
   /** Directory of built UI assets; served as an SPA when present. */
   uiDir?: string;
+  /** Enables HTTP Basic auth (any user name) on everything except /healthz when set. */
+  adminPassword?: string;
   extraRoutes?: Route[];
 }
 
@@ -527,6 +530,15 @@ export interface AdminServer {
   close(): Promise<void>;
 }
 
+/** Accepts `Basic base64(user:password)` with any user name; constant-time password compare. */
+function basicAuthOk(header: string | undefined, password: string): boolean {
+  if (header === undefined || !header.startsWith('Basic ')) return false;
+  const decoded = Buffer.from(header.slice(6).trim(), 'base64').toString('utf8');
+  const given = Buffer.from(decoded.slice(decoded.indexOf(':') + 1), 'utf8');
+  const expected = Buffer.from(password, 'utf8');
+  return given.byteLength === expected.byteLength && timingSafeEqual(given, expected);
+}
+
 /**
  * Starts the admin server on its own port (spec 3.4). Serves the JSON API
  * under <basePath>/api/v1, health under <basePath>/healthz, and the built
@@ -559,6 +571,24 @@ export function startAdminServer(ctx: AdminContext): Promise<AdminServer> {
     const segments = subPath.split('/').filter((s) => s !== '');
     const method = req.method ?? 'GET';
 
+    // Browsers attach Origin to every cross-site request; the UI is same-origin and
+    // curl sends none, so a mismatch can only be a cross-site (CSRF) request.
+    const origin = req.headers.origin;
+    const host = req.headers.host ?? '';
+    if (origin !== undefined && origin !== `http://${host}` && origin !== `https://${host}`) {
+      sendError(res, new ApiError(403, 'forbidden_origin', 'cross-origin admin requests are not allowed'));
+      return;
+    }
+    if (
+      ctx.adminPassword !== undefined &&
+      !subPath.startsWith('/healthz/') &&
+      !basicAuthOk(req.headers.authorization, ctx.adminPassword)
+    ) {
+      res.setHeader('www-authenticate', 'Basic realm="morpheus-proxy admin", charset="UTF-8"');
+      sendError(res, new ApiError(401, 'unauthorized', 'admin password required (MORPHEUS_ADMIN_PASSWORD)'));
+      return;
+    }
+
     for (const route of routes) {
       if (route.method !== method) continue;
       const params = matchRoute(route, segments);
@@ -587,6 +617,7 @@ export function startAdminServer(ctx: AdminContext): Promise<AdminServer> {
         host: ctx.config.admin.host,
         port: address.port,
         basePath,
+        auth: ctx.adminPassword !== undefined ? 'basic' : 'none',
       });
       resolve({
         port: address.port,

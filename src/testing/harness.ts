@@ -207,7 +207,7 @@ export interface TestStack extends TestProxy {
 
 /** Boots the proxy plus an admin server sharing the same stores. */
 export async function startTestStack(
-  opts: TestProxyOptions & { ready?: () => boolean },
+  opts: TestProxyOptions & { ready?: () => boolean; adminPassword?: string },
 ): Promise<TestStack> {
   const proxy = await startTestProxy(opts);
   const config: MorpheusConfig = {
@@ -234,6 +234,7 @@ export async function startTestStack(
     },
     ...(opts.scriptRunner ? { scriptRunner: opts.scriptRunner } : {}),
     ...(opts.manipulatorRunner ? { manipulatorRunner: opts.manipulatorRunner } : {}),
+    ...(opts.adminPassword !== undefined ? { adminPassword: opts.adminPassword } : {}),
   });
   const adminUrl = `http://127.0.0.1:${admin.port}/_morpheus`;
   return {

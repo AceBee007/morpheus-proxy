@@ -92,7 +92,7 @@ export class ScriptSandbox {
   private spawnWorker(): void {
     if (this.closed) return;
     this.restarts += 1;
-    const worker = spawn(process.execPath, ['-e', WORKER_SOURCE], {
+    const worker = spawn(process.execPath, ['--permission', '-e', WORKER_SOURCE], {
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     });
     this.worker = worker;

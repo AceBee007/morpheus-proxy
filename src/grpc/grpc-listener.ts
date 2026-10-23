@@ -1308,6 +1308,15 @@ export function grpcStreamHandler(
 ) => void {
   const { appLog } = runtime;
   return (stream, headers, _flags, rawHeaders) => {
+    // A client RST_STREAM / GOAWAY with an error code makes Node emit 'error' on
+    // the server stream; unhandled, that is an uncaught exception that kills the
+    // whole proxy. The 'close' handlers below do the actual cleanup and logging.
+    stream.on('error', (err: Error) => {
+      appLog.warn('grpc client stream error', {
+        path: String(headers[':path'] ?? '/'),
+        error: String(err),
+      });
+    });
     const ctx: StreamContext = {
       stream,
       path: String(headers[':path'] ?? '/'),
