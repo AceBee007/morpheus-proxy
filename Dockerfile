@@ -1,5 +1,5 @@
 # --- build the proxy (TypeScript -> dist/) ---
-FROM node:26.12.0-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS build
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -8,7 +8,7 @@ COPY src ./src
 RUN npm run build
 
 # --- build the React admin UI (-> ui/dist/) ---
-FROM node:26.12.0-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS ui
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS ui
 WORKDIR /app/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
@@ -16,7 +16,7 @@ COPY ui/ ./
 RUN npm run build
 
 # --- runtime ---
-FROM node:26.12.0-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5
+FROM node:26.12.1-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797
 WORKDIR /app
 ENV NODE_ENV=production
 
